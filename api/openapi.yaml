@@ -1,0 +1,376 @@
+openapi: 3.0.3
+info:
+  title: VibexCorp LinkedIn Outreach API
+  description: API autoritativa do Modular Monolith para automação e governança de campanhas B2B de LinkedIn Outreach.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Servidor Local de Desenvolvimento
+  - url: /api/v1
+    description: Gateway Reverso Traefik
+
+paths:
+  /auth/login:
+    post:
+      summary: Autenticação de Usuário e Extensão
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login bem-sucedido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Credenciais inválidas
+
+  /dashboard/metrics:
+    get:
+      summary: Obter Métricas Executivas em Tempo Real
+      tags: [Dashboard]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Métricas operacionais do tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardMetrics'
+
+  /contacts:
+    get:
+      summary: Listar Contatos da Organização
+      tags: [Contacts]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contacts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Contact'
+    post:
+      summary: Cadastrar ou Atualizar Contato com Deduplicação
+      tags: [Contacts]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContactInput'
+      responses:
+        '201':
+          description: Contato criado ou atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                  message:
+                    type: string
+
+  /campaigns:
+    get:
+      summary: Listar Campanhas
+      tags: [Campaigns]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Campaign'
+    post:
+      summary: Criar Nova Campanha
+      tags: [Campaigns]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CampaignInput'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+
+  /campaigns/{id}/start:
+    post:
+      summary: Iniciar ou Retomar Campanha com Validação Prévia
+      tags: [Campaigns]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Campanha iniciada com sucesso
+        '422':
+          description: Validação prévia falhou
+
+  /campaigns/{id}/pause:
+    post:
+      summary: Pausar Campanha
+      tags: [Campaigns]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Campanha pausada
+
+  /settings/kill-switch:
+    post:
+      summary: Ativar ou Desativar Global Emergency Kill Switch (PAUSE ALL OUTREACH)
+      tags: [Settings]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pause_all:
+                  type: boolean
+      responses:
+        '200':
+          description: Estado de emergência atualizado
+
+  /templates/preview:
+    post:
+      summary: Simular Resolução de Variáveis em Template
+      tags: [Templates]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                template_body:
+                  type: string
+                sample_data:
+                  type: object
+                  properties:
+                    first_name:
+                      type: string
+                    company:
+                      type: string
+                    job_title:
+                      type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TemplateRenderResult'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+        user:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            organization_id:
+              type: string
+              format: uuid
+            email:
+              type: string
+            name:
+              type: string
+            role:
+              type: string
+
+    DashboardMetrics:
+      type: object
+      properties:
+        active_campaigns:
+          type: integer
+        contacts_in_seq:
+          type: integer
+        waiting_followups:
+          type: integer
+        replies:
+          type: integer
+        completed:
+          type: integer
+        telemetry_processed:
+          type: integer
+        kill_switch_active:
+          type: boolean
+
+    Contact:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        first_name:
+          type: string
+        last_name:
+          type: string
+        full_name:
+          type: string
+        company:
+          type: string
+        job_title:
+          type: string
+        linkedin_url:
+          type: string
+        status:
+          type: string
+          enum: [pending, active, waiting, replied, completed, paused, failed, needs_review]
+        created_at:
+          type: string
+          format: date-time
+
+    ContactInput:
+      type: object
+      required: [first_name, linkedin_url]
+      properties:
+        first_name:
+          type: string
+        last_name:
+          type: string
+        full_name:
+          type: string
+        company:
+          type: string
+        job_title:
+          type: string
+        linkedin_url:
+          type: string
+        metadata:
+          type: object
+
+    Campaign:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [draft, scheduled, running, paused, completed, cancelled]
+        daily_limit:
+          type: integer
+        timezone:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    CampaignInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        daily_limit:
+          type: integer
+        allowed_start_time:
+          type: string
+        allowed_end_time:
+          type: string
+        timezone:
+          type: string
+        is_flow_custom:
+          type: boolean
+
+    TemplateRenderResult:
+      type: object
+      properties:
+        rendered_text:
+          type: string
+        needs_review:
+          type: boolean
+        missing_vars:
+          type: array
+          items:
+            type: string
+        error:
+          type: string
+          nullable: true

@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vibex_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: vibex_outreach
+      POSTGRES_USER: vibex_admin
+      POSTGRES_PASSWORD: vibex_secure_password_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vibex_admin -d vibex_outreach"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: vibex_redis
+    restart: always
+    command: redis-server --appendonly yes --requirepass vibex_redis_pass_2026
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "vibex_redis_pass_2026", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  traefik:
+    image: traefik:v3.1
+    container_name: vibex_gateway
+    restart: always
+    command:
+      - "--api.insecure=true"
+      - "--providers.file.filename=/etc/traefik/traefik.yml"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+      - "8081:8080" # Traefik Web UI Dashboard
+    volumes:
+      - ./infra/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+    depends_on:
+      api:
+        condition: service_started
+      frontend:
+        condition: service_started
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: ../infra/docker/api.Dockerfile
+    container_name: vibex_api
+    restart: always
+    environment:
+      ENV: development
+      PORT: "8080"
+      DATABASE_URL: "postgres://vibex_admin:vibex_secure_password_2026@postgres:5432/vibex_outreach?sslmode=disable"
+      REDIS_URL: "redis://:vibex_redis_pass_2026@redis:6379/0"
+      JWT_SECRET: "vibexcorp-enterprise-jwt-super-secret-key-32b"
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: ../infra/docker/worker.Dockerfile
+    container_name: vibex_worker
+    restart: always
+    environment:
+      ENV: development
+      DATABASE_URL: "postgres://vibex_admin:vibex_secure_password_2026@postgres:5432/vibex_outreach?sslmode=disable"
+      REDIS_URL: "redis://:vibex_redis_pass_2026@redis:6379/0"
+      WORKER_CONCURRENCY: "10"
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: ../infra/docker/scheduler.Dockerfile
+    container_name: vibex_scheduler
+    restart: always
+    environment:
+      ENV: development
+      DATABASE_URL: "postgres://vibex_admin:vibex_secure_password_2026@postgres:5432/vibex_outreach?sslmode=disable"
+      REDIS_URL: "redis://:vibex_redis_pass_2026@redis:6379/0"
+      SCHEDULER_INTERVAL_SECONDS: "5"
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../infra/docker/frontend.Dockerfile
+    container_name: vibex_frontend
+    restart: always
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:80/api/v1"
+      NEXT_PUBLIC_EVENTS_URL: "http://localhost:80/events/stream"
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,24 @@
+{
+  "name": "vibexcorp-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VibexCorp LinkedIn Outreach Chrome Extension (Manifest V3 Thin Client)",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "compile": "wxt compile"
+  },
+  "dependencies": {
+    "lucide-react": "^0.475.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.308",
+    "@types/react": "19.0.8",
+    "@types/react-dom": "19.0.3",
+    "@wxt-dev/module-react": "^1.2.2",
+    "typescript": "^5.7.3",
+    "wxt": "^0.19.28"
+  }
+}

@@ -1,0 +1,17 @@
+-- name: CreateUser :one
+INSERT INTO users (organization_id, email, password_hash, name, role)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING *;
+
+-- name: GetUserByEmail :one
+SELECT * FROM users
+WHERE email = $1;
+
+-- name: GetUserByID :one
+SELECT * FROM users
+WHERE id = $1;
+
+-- name: ListUsersByOrganization :many
+SELECT * FROM users
+WHERE organization_id = $1
+ORDER BY created_at DESC;

@@ -1,0 +1,71 @@
+entryPoints:
+  web:
+    address: ":80"
+
+http:
+  routers:
+    api-router:
+      rule: "PathPrefix(`/api/v1`)"
+      service: api-service
+      entryPoints:
+        - web
+      middlewares:
+        - cors-headers
+        - security-headers
+
+    events-router:
+      rule: "PathPrefix(`/events`)"
+      service: events-service
+      entryPoints:
+        - web
+      middlewares:
+        - cors-headers
+
+    frontend-router:
+      rule: "PathPrefix(`/`)"
+      service: frontend-service
+      entryPoints:
+        - web
+
+  services:
+    api-service:
+      loadBalancer:
+        servers:
+          - url: "http://api:8080"
+
+    events-service:
+      loadBalancer:
+        servers:
+          - url: "http://api:8080"
+
+    frontend-service:
+      loadBalancer:
+        servers:
+          - url: "http://frontend:3000"
+
+  middlewares:
+    cors-headers:
+      headers:
+        accessControlAllowMethods:
+          - "GET"
+          - "POST"
+          - "PUT"
+          - "PATCH"
+          - "DELETE"
+          - "OPTIONS"
+        accessControlAllowHeaders:
+          - "Authorization"
+          - "Content-Type"
+          - "X-Request-ID"
+          - "X-Organization-ID"
+        accessControlAllowOriginList:
+          - "*"
+        accessControlMaxAge: 100
+        addVaryHeader: true
+
+    security-headers:
+      headers:
+        sslRedirect: false
+        browserXssFilter: true
+        contentTypeNosniff: true
+        frameDeny: true
