@@ -409,6 +409,8 @@ Transformar o ecossistema VibexCorp LinkedIn Outreach em uma solução 100% func
 - Extração de conexões reais via auto-scroll ativa.
 - Disparo de mensagens pela extensão operacional com delay de segurança e reporte em tempo real.
 - Visibilidade completa de mensagens enviadas na Inbox, Atividades e Contatos do SaaS.
+- Repositório GitHub oficial criado e versionado: [https://github.com/vibexagencyoficial-bit/linkedinexus](https://github.com/vibexagencyoficial-bit/linkedinexus) (106 arquivos comitados na branch `main`).
+
 
 
 
