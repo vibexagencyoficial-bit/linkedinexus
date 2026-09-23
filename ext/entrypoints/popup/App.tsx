@@ -24,6 +24,11 @@ interface BgState {
   last_sent_name: string;
   last_sent_at: string;
   last_error: string;
+  last_cycle_at?: string;
+  last_jev_ms?: number;
+  last_assist_total_ms?: number;
+  last_roundtrip_ms?: number;
+  last_assist_source?: string;
 }
 
 const EMPTY_STATE: BgState = {
@@ -36,6 +41,11 @@ const EMPTY_STATE: BgState = {
   last_sent_name: "",
   last_sent_at: "",
   last_error: "",
+  last_cycle_at: "",
+  last_jev_ms: 0,
+  last_assist_total_ms: 0,
+  last_roundtrip_ms: 0,
+  last_assist_source: "",
 };
 
 // NOTA Fase D: o único caminho de pareamento é o Código de Pareamento
@@ -86,17 +96,40 @@ export function App() {
         return;
       }
 
+      // Só declaramos sucesso com os DOIS tokens na mão e gravados no
+      // storage (checando chrome.runtime.lastError — docs Chrome/Context7).
+      // Sucesso sem persistência é o bug que mostrava "Pareado!" com a
+      // badge em SEM PAREAMENTO.
+      if (typeof data.extension_token !== "string" || !data.extension_token ||
+          typeof data.api_jwt !== "string" || !data.api_jwt) {
+        setStatusMsg("Resposta incompleta do servidor — gere um novo código no painel e tente de novo.");
+        setPairing(false);
+        return;
+      }
+
       chrome.storage.local.set(
         {
           extension_token: data.extension_token,
-          api_jwt: data.api_jwt ?? "",
+          api_jwt: data.api_jwt,
           device_id: data.device_id ?? "",
         },
         () => {
-          setStatusMsg("✓ Pareado! A campanha ativa no painel passa a rodar aqui.");
+          if (chrome.runtime.lastError) {
+            setStatusMsg(`Falha ao salvar o pareamento: ${chrome.runtime.lastError.message}`);
+            setPairing(false);
+            return;
+          }
+          setStatusMsg("✓ Pareado! Redirecionando para o LinkedIn…");
           setPairingCode("");
           refresh();
           setPairing(false);
+          // Acorda o service worker IMEDIATAMENTE: sem isso ele pode estar
+          // adormecido e o polling só retornaria no próximo alarme (1min).
+          chrome.runtime.sendMessage({ action: "DISPATCH_NOW" }, () => {
+            void chrome.runtime.lastError; // fire-and-forget: SW pode nem estar acordado
+          });
+          // Redirect para o LinkedIn: identidade e automação vivem lá.
+          chrome.tabs.create({ url: "https://www.linkedin.com/feed/", active: true });
         }
       );
     } catch {
@@ -153,12 +186,17 @@ export function App() {
 
   const handleLogout = () => {
     chrome.storage.local.remove(
-      ["extension_token", "api_jwt", "device_id", "auth_token", "bg_state", "outreach_paused"],
-      () => refresh()
+      ["extension_token", "api_jwt", "device_id", "auth_token", "bg_state", "outreach_paused", "automation_tab_id"],
+      () => {
+        setStatusMsg("");
+        refresh();
+      }
     );
   };
 
-  const paired = state.paired || hasExtensionToken;
+  // Definição ÚNICA de pareado: os dois tokens (a badge antiga aceitava
+  // extension_token sozinho — pareamento "meio pareado" que nunca despachava).
+  const paired = state.paired;
   const dailyText =
     state.daily_remaining >= 0 ? `${state.daily_remaining} restantes hoje` : "saldo desconhecido";
 
@@ -194,6 +232,13 @@ export function App() {
         </div>
       )}
 
+      {!paired && hasExtensionToken && !statusMsg && (
+        <div style={{ marginBottom: 10, padding: "8px 10px", borderRadius: 6, backgroundColor: "#3b2708", border: "1px solid #b45309", color: "#fcd34d", fontSize: 11, display: "flex", gap: 6, alignItems: "center" }}>
+          <AlertCircle size={13} />
+          <span>Pareamento incompleto (falta token de sessão) — gere um novo código no painel e vincule de novo.</span>
+        </div>
+      )}
+
       {paired ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {/* Campanha ativa — estado real do pipeline (pending-outreach) */}
@@ -217,6 +262,17 @@ export function App() {
             <div style={{ padding: 10, backgroundColor: "#1e1b4b", borderRadius: 8, border: "1px solid #4338ca", fontSize: 11, color: "#c7d2fe", display: "flex", alignItems: "center", gap: 6 }}>
               <Send size={13} />
               <span>Automação executando um envio no LinkedIn…</span>
+            </div>
+          )}
+
+          {/* Prova de vida do ciclo: se o service worker adormeceu, este
+              carimbo fica velho e o usuário vê — não é mais "nada acontece". */}
+          {state.last_cycle_at && !state.dispatching && (
+            <div style={{ padding: "6px 10px", fontSize: 10, color: "#71717a", textAlign: "center" }}>
+              Último ciclo: {new Date(state.last_cycle_at).toLocaleTimeString("pt-BR")}
+              {state.last_assist_source && (
+                <span> · Jev: {state.last_jev_ms} ms · ida-volta {state.last_roundtrip_ms} ms ({state.last_assist_source})</span>
+              )}
             </div>
           )}
 

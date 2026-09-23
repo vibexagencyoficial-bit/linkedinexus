@@ -75,42 +75,6 @@ services:
       redis:
         condition: service_healthy
 
-  worker:
-    build:
-      context: ./backend
-      dockerfile: ../infra/docker/worker.Dockerfile
-    container_name: vibex_worker
-    restart: always
-    environment:
-      ENV: development
-      DATABASE_URL: "postgres://vibex_admin:vibex_secure_password_2026@postgres:5432/vibex_outreach?sslmode=disable"
-      REDIS_URL: "redis://:vibex_redis_pass_2026@redis:6379/0"
-      WORKER_CONCURRENCY: "10"
-      LOG_LEVEL: info
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-  scheduler:
-    build:
-      context: ./backend
-      dockerfile: ../infra/docker/scheduler.Dockerfile
-    container_name: vibex_scheduler
-    restart: always
-    environment:
-      ENV: development
-      DATABASE_URL: "postgres://vibex_admin:vibex_secure_password_2026@postgres:5432/vibex_outreach?sslmode=disable"
-      REDIS_URL: "redis://:vibex_redis_pass_2026@redis:6379/0"
-      SCHEDULER_INTERVAL_SECONDS: "5"
-      LOG_LEVEL: info
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
   frontend:
     build:
       context: ./frontend

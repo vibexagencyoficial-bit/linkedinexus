@@ -1,9 +1,10 @@
 /**
- * F4 — TDD: página /extension honesta.
+ * R4 — TDD: seção "Extensão Chrome" em Configurações é honesta.
  *
- * A página dedicada da extensão herda o contrato A1: status OFFLINE real
- * quando a API falha, erro visível e nenhum código de pareamento fabricado
- * (Math.random jamais gera pairing).
+ * A gestão da extensão mora agora em /settings (a rota /extension só
+ * redireciona). O contrato A1 continua: status OFFLINE real quando a API
+ * falha, erro visível e nenhum código de pareamento fabricado (Math.random
+ * jamais gera pairing).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import React from "react";
@@ -23,7 +24,7 @@ vi.mock("@/lib/api", () => ({
   EXTENSION_DOWNLOAD_URL: "http://localhost:8080/api/v1/downloads/extension.zip",
 }));
 
-import ExtensionPage from "@/app/(dashboard)/extension/page";
+import { ExtensionSection } from "@/components/settings/ExtensionSection";
 import { cleanup } from "@testing-library/react";
 
 beforeEach(() => {
@@ -34,14 +35,14 @@ afterEach(() => {
   cleanup();
 });
 
-describe("F4 — página /extension honesta", () => {
+describe("R4 — seção Extensão em Configurações é honesta", () => {
   it("mostra o passo a passo de instalação e o botão de download", async () => {
     mocks.getExtensionStatus.mockResolvedValue({ connected: false });
 
-    render(<ExtensionPage />);
+    render(<ExtensionSection />);
 
     expect(screen.getByText("Baixar Extensão (.zip)")).toBeTruthy();
-    expect(screen.getByText("Ative o Modo do Desenvolvedor")).toBeTruthy();
+    expect(screen.getByText("Ative o Modo do desenvolvedor")).toBeTruthy();
     const link = screen.getByText("Baixar Extensão (.zip)").closest("a");
     expect(link?.getAttribute("href")).toContain("/downloads/extension.zip");
   });
@@ -51,12 +52,12 @@ describe("F4 — página /extension honesta", () => {
       new Error("STORE_UNAVAILABLE: postgres offline")
     );
 
-    render(<ExtensionPage />);
+    render(<ExtensionSection />);
 
     await waitFor(() => {
       expect(screen.getByText("OFFLINE")).toBeTruthy();
     });
-    expect(screen.queryByText("Extensão Ativa e Sincronizada")).toBeNull();
+    expect(screen.queryByText("Extensão ativa e sincronizada")).toBeNull();
     expect(
       screen.getByText(/STORE_UNAVAILABLE: postgres offline/i)
     ).toBeTruthy();
@@ -69,12 +70,12 @@ describe("F4 — página /extension honesta", () => {
       new Error("STORE_UNAVAILABLE: postgres offline")
     );
 
-    render(<ExtensionPage />);
+    render(<ExtensionSection />);
 
     await waitFor(() => {
-      expect(screen.getByText("Gerar Código de Pareamento")).toBeTruthy();
+      expect(screen.getByText(/Gerar código de pareamento/i)).toBeTruthy();
     });
-    fireEvent.click(screen.getByText("Gerar Código de Pareamento"));
+    fireEvent.click(screen.getByText(/Gerar código de pareamento/i));
 
     await waitFor(() => {
       expect(mocks.generatePairingCode).toHaveBeenCalled();
@@ -82,10 +83,10 @@ describe("F4 — página /extension honesta", () => {
     // Contrato honesto: Math.random jamais é usado como pairing:
     expect(randomSpy).not.toHaveBeenCalled();
     // Nenhum bloco de código fictício exibido:
-    expect(screen.queryByText(/Código de Pareamento Único/i)).toBeNull();
+    expect(screen.queryByText(/Código de pareamento único/i)).toBeNull();
     // O erro real substitui o código:
     await waitFor(() => {
-      expect(screen.getByText("Falha ao gerar código de pareamento")).toBeTruthy();
+      expect(screen.getByText("Falha ao gerar o código de pareamento")).toBeTruthy();
     });
     randomSpy.mockRestore();
   });
@@ -97,16 +98,16 @@ describe("F4 — página /extension honesta", () => {
       expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
     });
 
-    render(<ExtensionPage />);
+    render(<ExtensionSection />);
 
     await waitFor(() => {
-      expect(screen.getByText("Gerar Código de Pareamento")).toBeTruthy();
+      expect(screen.getByText(/Gerar código de pareamento/i)).toBeTruthy();
     });
-    fireEvent.click(screen.getByText("Gerar Código de Pareamento"));
+    fireEvent.click(screen.getByText(/Gerar código de pareamento/i));
 
     await waitFor(() => {
       expect(screen.getByText("8A2F1B09")).toBeTruthy();
     });
-    expect(screen.getByText(/Código de Pareamento Único/i)).toBeTruthy();
+    expect(screen.getByText(/Código de pareamento único/i)).toBeTruthy();
   });
 });

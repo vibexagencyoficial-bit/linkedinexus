@@ -26,12 +26,17 @@ type Claims struct {
 	OrganizationID uuid.UUID `json:"organization_id"`
 	Email          string    `json:"email"`
 	Role           string    `json:"role"`
+	// SessionID amarra o JWT a uma linha de auth_sessions (DB): sem sessão
+	// viva (expirada/revogada), o token NÃO autentica — revogação imediata.
+	SessionID string `json:"sid,omitempty"`
 	jwt.RegisteredClaims
 }
 
 type Service struct {
 	secretKey     []byte
 	tokenDuration time.Duration
+
+	sessionValidator func(ctx context.Context, sessionID string) error
 }
 
 func NewService(secret string, duration time.Duration) *Service {
@@ -52,13 +57,20 @@ func CheckPassword(password, hash string) bool {
 }
 
 func (s *Service) GenerateToken(userID, orgID uuid.UUID, email, role string) (string, error) {
+	return s.GenerateTokenWithTTL(userID, orgID, email, role, s.tokenDuration, "")
+}
+
+// GenerateTokenWithTTL emite um JWT TEMPORÁRIO com TTL explícito e session id
+// opcional (amarrado a auth_sessions). Tokens curtos + sessão revogável.
+func (s *Service) GenerateTokenWithTTL(userID, orgID uuid.UUID, email, role string, ttl time.Duration, sessionID string) (string, error) {
 	claims := Claims{
 		UserID:         userID,
 		OrganizationID: orgID,
 		Email:          email,
 		Role:           role,
+		SessionID:      sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(s.tokenDuration)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    "vibexcorp-linkedin-outreach",
 		},
@@ -90,25 +102,48 @@ func (s *Service) ParseToken(tokenStr string) (*Claims, error) {
 	return nil, errors.New("invalid token claims")
 }
 
-// Middleware verifies Authorization: Bearer <token> and sets tenant context
+// SetSessionValidator registra a checagem de sessão viva (auth_sessions).
+// Chamado pelo Server no boot; nil = sem checagem (apenas assinatura).
+func (s *Service) SetSessionValidator(v func(ctx context.Context, sessionID string) error) {
+	s.sessionValidator = v
+}
+
+// Middleware verifies Authorization: Bearer <token> and sets tenant context.
+// Fallback: access_token na query (EventSource/SSE não consegue setar header).
 func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenStr := ""
 		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, `{"error":"authorization header required"}`, http.StatusUnauthorized)
-			return
+		if authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+				http.Error(w, `{"error":"authorization header must be Bearer <token>"}`, http.StatusUnauthorized)
+				return
+			}
+			tokenStr = parts[1]
+		} else {
+			// SSE: EventSource não envia headers — token via query é o
+			// padrão suportado para streams.
+			tokenStr = r.URL.Query().Get("access_token")
+			if tokenStr == "" {
+				http.Error(w, `{"error":"authorization header required"}`, http.StatusUnauthorized)
+				return
+			}
 		}
 
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-			http.Error(w, `{"error":"authorization header must be Bearer <token>"}`, http.StatusUnauthorized)
-			return
-		}
-
-		claims, err := s.ParseToken(parts[1])
+		claims, err := s.ParseToken(tokenStr)
 		if err != nil {
 			http.Error(w, `{"error":"invalid or expired token"}`, http.StatusUnauthorized)
 			return
+		}
+
+		// Sessão DB-backed: JWT assinado mas revogado/expirado no banco NÃO
+		// autentica (revogação imediata de logout/desconectar).
+		if s.sessionValidator != nil && claims.SessionID != "" {
+			if verr := s.sessionValidator(r.Context(), claims.SessionID); verr != nil {
+				http.Error(w, `{"error":"session revoked or expired"}`, http.StatusUnauthorized)
+				return
+			}
 		}
 
 		ctx := r.Context()

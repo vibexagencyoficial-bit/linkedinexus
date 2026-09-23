@@ -4,6 +4,28 @@ entryPoints:
 
 http:
   routers:
+    # Rotas sensíveis com teto duro ANTES do router geral (rule mais longa =
+    # prioridade maior no Traefik). Anti brute-force no gateway.
+    login-router:
+      rule: "PathPrefix(`/api/v1/auth/login`)"
+      service: api-service
+      entryPoints:
+        - web
+      middlewares:
+        - cors-headers
+        - security-headers
+        - rl-login
+
+    pair-router:
+      rule: "PathPrefix(`/api/v1/extension/pair`)"
+      service: api-service
+      entryPoints:
+        - web
+      middlewares:
+        - cors-headers
+        - security-headers
+        - rl-pair
+
     api-router:
       rule: "PathPrefix(`/api/v1`)"
       service: api-service
@@ -12,6 +34,7 @@ http:
       middlewares:
         - cors-headers
         - security-headers
+        - rl-api-global
 
     events-router:
       rule: "PathPrefix(`/events`)"
@@ -44,6 +67,26 @@ http:
           - url: "http://frontend:3000"
 
   middlewares:
+    # Rate limit por IP (token bucket average/period/burst — docs Traefik).
+    rl-api-global:
+      rateLimit:
+        average: 100   # req/s sustentados
+        period: 1m
+        burst: 150
+
+    rl-login:
+      rateLimit:
+        average: 10    # 10/min por IP — brute-force de senha morre aqui
+        period: 1m
+        burst: 15
+
+    rl-pair:
+      rateLimit:
+        average: 6     # 6/min por IP — brute-force do código de 8 hex morre aqui
+        period: 1m
+        burst: 10
+
+    # CORS allowlist (SEM wildcard): extensão Chrome + painéis locais.
     cors-headers:
       headers:
         accessControlAllowMethods:
@@ -57,9 +100,10 @@ http:
           - "Authorization"
           - "Content-Type"
           - "X-Request-ID"
-          - "X-Organization-ID"
         accessControlAllowOriginList:
-          - "*"
+          - "http://localhost:3001"
+          - "http://localhost:3000"
+        accessControlAllowOriginListRegex: "^chrome-extension://"
         accessControlMaxAge: 100
         addVaryHeader: true
 

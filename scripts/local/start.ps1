@@ -124,12 +124,20 @@ if (Test-Path $DotEnvPath) {
 }
 Push-Location (Join-Path $RepoRoot "backend")
 try {
-  if (-not (Test-Path ".\bin\api.exe")) {
-    Write-Host "[api] compilando ..."
-    New-Item -ItemType Directory -Force ".\bin" | Out-Null
-    go build -o .\bin\api.exe .\cmd\api
-  }
+  # Rebuild incondicional: binário stale (exe antigo rodando código velho) foi
+  # a causa do painel mostrar estado que não existia no banco.
+  Write-Host "[api] compilando ..."
+  New-Item -ItemType Directory -Force ".\bin" | Out-Null
+  go build -o .\bin\api.exe .\cmd\api
+  if ($LASTEXITCODE -ne 0) { throw "go build falhou ($LASTEXITCODE)" }
 } finally { Pop-Location }
+# Se uma API antiga já está na porta, derruba antes de subir a nova.
+$oldApi = Get-NetTCPConnection -LocalPort $ApiPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($oldApi) {
+  Write-Host "[api] encerrando processo antigo na porta $ApiPort (PID $($oldApi.OwningProcess)) ..."
+  Stop-Process -Id $oldApi.OwningProcess -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 1
+}
 if (-not (Get-NetTCPConnection -LocalPort $ApiPort -State Listen -ErrorAction SilentlyContinue)) {
   Write-Host "[api] iniciando na porta $ApiPort ..."
   # Start-Process herda o ambiente atual: define aqui (vale só para esta sessão de boot).

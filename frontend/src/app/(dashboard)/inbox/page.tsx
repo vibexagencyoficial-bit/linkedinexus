@@ -1,29 +1,27 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Search,
-  MessageSquare,
   ShieldCheck,
   CheckCircle2,
-  Send,
-  User,
   ExternalLink,
-  Clock,
-  Sparkles,
   Inbox as InboxIcon,
   RefreshCw,
-  AlertTriangle,
+  Sparkles,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { ConversationItem } from "@vibexcorp/api-client";
+import { useAuth } from "@/lib/auth-context";
+import { useLiveEvents } from "@/lib/sse";
+import { ConversationItem, ConversationMessage } from "@vibexcorp/api-client";
 
 export default function InboxPage() {
+  const { token } = useAuth();
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
   const [isSimulatingReply, setIsSimulatingReply] = useState(false);
+  const [thread, setThread] = useState<ConversationMessage[]>([]);
 
   const loadConversations = async () => {
     try {
@@ -36,11 +34,32 @@ export default function InboxPage() {
     }
   };
 
+  // Thread REAL da conversa (a lista vem sem mensagens por design —
+  // carregar a thread aqui; sem isso o painel nunca mostrava as mensagens).
+  const loadThread = async (convId: string) => {
+    try {
+      const conv = await api.getConversation(convId);
+      setThread(conv.messages ?? []);
+    } catch {
+      setThread([]);
+    }
+  };
+
   useEffect(() => {
     loadConversations();
     const interval = setInterval(loadConversations, 3000);
     return () => clearInterval(interval);
   }, []);
+
+  // AO VIVO: novo disparo/resposta atualiza lista e thread na hora (SSE).
+  useLiveEvents(token, (type) => {
+    if (type === "message.sent" || type === "message.queued" || type === "reply.detected") {
+      loadConversations();
+      if (activeConvIdRef.current) loadThread(activeConvIdRef.current);
+    }
+  });
+
+  const activeConvIdRef = useRef<string | null>(null);
 
   const filteredConversations = conversations.filter((c) => {
     if (!searchQuery) return true;
@@ -58,108 +77,121 @@ export default function InboxPage() {
     conversations[0] ||
     null;
 
+  // Carrega a thread quando a conversa ativa muda (ou chega mensagem nova).
+  useEffect(() => {
+    activeConvIdRef.current = activeConv?.id ?? null;
+    if (activeConv?.id) {
+      loadThread(activeConv.id);
+    } else {
+      setThread([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConv?.id, activeConv?.lastMessage]);
+
   const handleSimulateReply = async () => {
     if (!activeConv) return;
     setIsSimulatingReply(true);
     try {
+      // Stop on Reply espera contact_id (o backend atualiza o contato) —
+      // antes passava o id da conversa e recebia 404 sempre.
       await api.reportReply(
-        activeConv.id,
+        activeConv.contact_id ?? activeConv.id,
         activeConv.leadName,
         "Olá! Agradeço pelo contato. Vamos sim agendar um call para conversar sobre as soluções da sua empresa!"
       );
       await loadConversations();
-    } catch (err: any) {
-      alert("Erro ao simular resposta: " + err.message);
+      if (activeConv.id) await loadThread(activeConv.id);
+    } catch (err: unknown) {
+      alert("Erro ao simular resposta: " + (err instanceof Error ? err.message : ""));
     } finally {
       setIsSimulatingReply(false);
     }
   };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-5.5rem)] space-y-4">
-      {/* Top Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-zinc-800/80 gap-3">
+    <div className="flex h-[calc(100dvh-8rem)] flex-col space-y-4">
+      {/* Cabeçalho */}
+      <div className="flex flex-col justify-between gap-3 border-b border-[#eef0f6] pb-3 sm:flex-row sm:items-center">
         <div>
-          <div className="flex items-center space-x-3">
-            <h1 className="text-xl font-bold text-white tracking-tight">Inbox & Mensagens do LinkedIn</h1>
-            <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs font-mono font-medium">
-              Zero-Evasion Mode
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="text-lg font-bold tracking-tight text-slate-900">
+              Mensagens do LinkedIn
+            </h2>
+            <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700">
+              Stop on Reply ativo
             </span>
           </div>
-          <p className="text-xs text-zinc-400 mt-0.5">
-            Visibilidade unificada das mensagens enviadas pela extensão no LinkedIn e detecção em tempo real de Stop on Reply.
+          <p className="mt-0.5 text-sm text-slate-500">
+            Visibilidade unificada das mensagens enviadas pela extensão no LinkedIn e detecção em tempo real de respostas.
           </p>
         </div>
 
-        <div className="flex items-center space-x-2">
+        <div className="flex items-center gap-2">
           <button
             onClick={loadConversations}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-zinc-800 bg-[#16171a] hover:bg-zinc-800 text-xs text-zinc-300 transition"
+            className="flex items-center gap-2 rounded-lg border border-[#e8eaf1] bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
           >
-            <RefreshCw className="w-3.5 h-3.5 text-zinc-400" />
+            <RefreshCw className="h-4 w-4 text-slate-400" />
             <span>Atualizar</span>
           </button>
-          <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-zinc-800 bg-[#16171a] text-xs text-zinc-300">
-            <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Stop on Reply Ativo</span>
-          </div>
         </div>
       </div>
 
-      {/* Main Inbox Studio Workspace (Attio Layout) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 flex-1 overflow-hidden">
-        {/* Left: Conversation List (4 cols) */}
-        <div className="lg:col-span-4 rounded-xl border border-zinc-800 bg-[#111215] flex flex-col overflow-hidden">
-          <div className="p-3 border-b border-zinc-800">
+      {/* Área principal da inbox */}
+      <div className="grid flex-1 grid-cols-1 gap-4 overflow-hidden lg:grid-cols-12">
+        {/* Esquerda: lista de conversas */}
+        <div className="flex flex-col overflow-hidden rounded-2xl border border-[#e8eaf1] bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04)] lg:col-span-4">
+          <div className="border-b border-[#eef0f6] p-3">
             <div className="relative">
-              <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-zinc-500" />
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
               <input
                 type="text"
-                placeholder="Buscar conversas por nome, empresa ou mensagem..."
+                placeholder="Buscar por nome, empresa ou mensagem..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-8 pr-3 py-1.5 text-xs bg-[#16171a] border border-zinc-800 rounded-md text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-700"
+                className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] py-2 pl-9 pr-3 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
               />
             </div>
           </div>
 
           <div className="flex-1 overflow-y-auto">
             {filteredConversations.length === 0 ? (
-              /* Attio-Style Clean Empty State */
-              <div className="p-8 text-center space-y-2 text-zinc-500">
-                <InboxIcon className="w-6 h-6 mx-auto text-zinc-600" />
-                <span className="text-xs font-medium text-zinc-400 block">Nenhuma conversa registrada</span>
-                <p className="text-[11px] leading-relaxed max-w-xs mx-auto">
+              <div className="space-y-2 p-8 text-center text-slate-500">
+                <InboxIcon className="mx-auto h-7 w-7 text-slate-300" />
+                <span className="block text-sm font-medium text-slate-600">
+                  Nenhuma conversa registrada
+                </span>
+                <p className="mx-auto max-w-xs text-xs leading-relaxed text-slate-400">
                   Assim que a extensão disparar mensagens para suas conexões do LinkedIn, o histórico de cada contato aparecerá aqui em tempo real.
                 </p>
               </div>
             ) : (
-              <div className="divide-y divide-zinc-800/60">
+              <div className="divide-y divide-[#eef0f6]">
                 {filteredConversations.map((conv) => (
                   <div
                     key={conv.id}
                     onClick={() => setSelectedId(conv.id)}
-                    className={`p-3.5 cursor-pointer transition ${
+                    className={`cursor-pointer p-3.5 transition ${
                       activeConv?.id === conv.id
-                        ? "bg-zinc-800/70 border-l-2 border-indigo-500"
-                        : "hover:bg-zinc-800/30"
+                        ? "border-l-2 border-indigo-500 bg-indigo-50/60"
+                        : "border-l-2 border-transparent hover:bg-[#f8f9fc]"
                     }`}
                   >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="font-semibold text-xs text-white truncate">{conv.leadName}</span>
-                      <span className="text-[10px] text-zinc-500 font-mono">{conv.lastMessageTime}</span>
+                    <div className="mb-1 flex items-center justify-between">
+                      <span className="truncate text-sm font-semibold text-slate-900">{conv.leadName}</span>
+                      <span className="font-mono text-xs text-slate-400">{conv.lastMessageTime}</span>
                     </div>
-                    <div className="flex items-center justify-between gap-2 mb-1.5">
-                      <span className="text-[11px] text-zinc-400 block truncate">
+                    <div className="mb-1.5 flex items-center justify-between gap-2">
+                      <span className="block truncate text-xs text-slate-500">
                         {conv.jobTitle} · {conv.company}
                       </span>
                       {conv.hasReplied && (
-                        <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex-shrink-0">
+                        <span className="flex-shrink-0 rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-700">
                           Respondeu
                         </span>
                       )}
                     </div>
-                    <p className="text-xs text-zinc-300 line-clamp-1 leading-snug">{conv.lastMessage}</p>
+                    <p className="line-clamp-1 text-sm leading-snug text-slate-600">{conv.lastMessage}</p>
                   </div>
                 ))}
               </div>
@@ -167,26 +199,26 @@ export default function InboxPage() {
           </div>
         </div>
 
-        {/* Right: Message Thread & Stop on Reply Banner (8 cols) */}
-        <div className="lg:col-span-8 rounded-xl border border-zinc-800 bg-[#0e0f12] flex flex-col overflow-hidden">
+        {/* Direita: thread e banner de Stop on Reply */}
+        <div className="flex flex-col overflow-hidden rounded-2xl border border-[#e8eaf1] bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04)] lg:col-span-8">
           {activeConv ? (
             <>
-              {/* Thread Header */}
-              <div className="p-4 border-b border-zinc-800/80 bg-[#121316] flex items-center justify-between flex-wrap gap-2">
+              {/* Cabeçalho da thread */}
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eef0f6] bg-[#f8f9fc] p-4">
                 <div>
-                  <div className="flex items-center gap-2">
-                    <h2 className="text-sm font-semibold text-white">{activeConv.leadName}</h2>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-base font-semibold text-slate-900">{activeConv.leadName}</h3>
                     {activeConv.hasReplied ? (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
-                        ✓ STOP ON REPLY ATIVADO
+                      <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700">
+                        Stop on Reply ativado
                       </span>
                     ) : (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-medium">
-                        AGUARDANDO RESPOSTA
+                      <span className="rounded-full border border-indigo-100 bg-indigo-50 px-2.5 py-0.5 text-xs font-medium text-indigo-700">
+                        Aguardando resposta
                       </span>
                     )}
                   </div>
-                  <span className="text-xs text-zinc-400">
+                  <span className="text-sm text-slate-500">
                     {activeConv.jobTitle} · {activeConv.company}
                   </span>
                 </div>
@@ -195,11 +227,11 @@ export default function InboxPage() {
                   <button
                     onClick={handleSimulateReply}
                     disabled={isSimulatingReply || activeConv.hasReplied}
-                    className="flex items-center space-x-1 px-2.5 py-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 text-[11px] font-medium transition disabled:opacity-40"
+                    className="flex items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 transition hover:bg-amber-100 disabled:opacity-40"
                     title="Simula uma resposta deste contato para testar o Stop on Reply automático"
                   >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>{activeConv.hasReplied ? "Resposta Registrada" : "Testar Stop on Reply"}</span>
+                    <Sparkles className="h-3.5 w-3.5" />
+                    <span>{activeConv.hasReplied ? "Resposta registrada" : "Testar Stop on Reply"}</span>
                   </button>
 
                   {activeConv.linkedinUrl && (
@@ -207,61 +239,66 @@ export default function InboxPage() {
                       href={activeConv.linkedinUrl}
                       target="_blank"
                       rel="noreferrer"
-                      className="flex items-center space-x-1 px-2.5 py-1.5 rounded-md border border-zinc-700 bg-zinc-800/60 hover:bg-zinc-800 text-zinc-200 text-[11px] transition"
+                      className="flex items-center gap-1.5 rounded-lg border border-[#e8eaf1] bg-white px-3 py-1.5 text-sm text-slate-700 transition hover:bg-slate-50"
                     >
                       <span>Abrir no LinkedIn</span>
-                      <ExternalLink className="w-3 h-3 text-zinc-400" />
+                      <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
                     </a>
                   )}
                 </div>
               </div>
 
-              {/* Stop on Reply Banner if replied */}
+              {/* Banner de Stop on Reply quando respondeu */}
               {activeConv.hasReplied && (
-                <div className="p-3 bg-emerald-950/40 border-b border-emerald-500/30 flex items-center justify-between text-xs text-emerald-300">
+                <div className="flex items-center justify-between border-b border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
                   <div className="flex items-center gap-2">
-                    <ShieldCheck className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                    <ShieldCheck className="h-4 w-4 flex-shrink-0 text-emerald-600" />
                     <span>
-                      <b>Stop on Reply executado:</b> Este contato respondeu no LinkedIn. Todos os próximos follow-ups foram cancelados automaticamente para preservar o relacionamento.
+                      <b>Stop on Reply executado:</b> este contato respondeu no LinkedIn. Todos os próximos follow-ups foram cancelados automaticamente para preservar o relacionamento.
                     </span>
                   </div>
                 </div>
               )}
 
-              {/* Messages Scroll Area */}
-              <div className="flex-1 p-5 overflow-y-auto space-y-4">
-                {activeConv.messages.map((msg) => (
+              {/* Área de mensagens — thread REAL carregada via getConversation */}
+              <div className="flex-1 space-y-4 overflow-y-auto p-5">
+                {thread.length === 0 && (
+                  <p className="text-center text-sm text-slate-400">
+                    Nenhuma mensagem nesta conversa ainda.
+                  </p>
+                )}
+                {thread.map((msg) => (
                   <div
                     key={msg.id}
                     className={`flex flex-col ${
                       msg.direction === "outbound" ? "items-end" : "items-start"
                     }`}
                   >
-                    <div className="flex items-center gap-1.5 mb-1 text-[10px] text-zinc-500 font-mono">
-                      <span>{msg.direction === "outbound" ? "Enviado por você (Extensão)" : activeConv.leadName}</span>
+                    <div className="mb-1 flex items-center gap-1.5 text-xs text-slate-400">
+                      <span>{msg.direction === "outbound" ? "Enviado por você (extensão)" : activeConv.leadName}</span>
                       <span>·</span>
                       <span>{msg.sentAt}</span>
                     </div>
 
                     <div
-                      className={`max-w-lg p-3.5 rounded-xl text-xs leading-relaxed ${
+                      className={`max-w-lg rounded-2xl p-3.5 text-sm leading-relaxed ${
                         msg.direction === "outbound"
-                          ? "bg-indigo-600/90 text-white rounded-br-none shadow-sm"
-                          : "bg-zinc-800/90 text-zinc-100 rounded-bl-none border border-zinc-700/60 shadow-sm"
+                          ? "rounded-br-sm bg-indigo-600 text-white"
+                          : "rounded-bl-sm border border-[#e8eaf1] bg-[#f8f9fc] text-slate-700"
                       }`}
                     >
                       <p className="whitespace-pre-line">{msg.content}</p>
                     </div>
 
-                    <div className="flex items-center gap-1.5 mt-1 text-[10px] text-zinc-500">
+                    <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
                       {msg.stepTag && (
-                        <span className="font-mono text-[9px] text-zinc-400 bg-zinc-800/80 px-1.5 py-0.5 rounded">
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-500">
                           {msg.stepTag}
                         </span>
                       )}
                       {msg.direction === "outbound" && (
-                        <span className="text-indigo-400 text-[10px] flex items-center gap-1">
-                          <CheckCircle2 className="w-3 h-3" />
+                        <span className="flex items-center gap-1 text-indigo-600">
+                          <CheckCircle2 className="h-3 w-3" />
                           <span>Entregue via LinkedIn</span>
                         </span>
                       )}
@@ -271,13 +308,13 @@ export default function InboxPage() {
               </div>
             </>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-zinc-500 space-y-3">
-              <div className="w-10 h-10 rounded-lg bg-zinc-800/60 border border-zinc-700/60 flex items-center justify-center text-zinc-400">
-                <ShieldCheck className="w-5 h-5 text-emerald-400" />
+            <div className="flex flex-1 flex-col items-center justify-center space-y-3 p-8 text-center text-slate-500">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-[#e8eaf1] bg-[#f4f5fa]">
+                <ShieldCheck className="h-6 w-6 text-emerald-500" />
               </div>
               <div>
-                <h3 className="text-sm font-semibold text-white">Inbox Integrada do LinkedIn</h3>
-                <p className="text-xs text-zinc-400 max-w-sm mt-1">
+                <h3 className="text-base font-semibold text-slate-900">Inbox integrada do LinkedIn</h3>
+                <p className="mx-auto mt-1 max-w-sm text-sm text-slate-500">
                   Selecione uma conversa ao lado para acompanhar o histórico de mensagens enviadas e gerenciar as respostas com Stop on Reply automático.
                 </p>
               </div>

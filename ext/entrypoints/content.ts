@@ -259,6 +259,13 @@ export default defineContentScript({
     // longas ocasionais (parâmetros vindos do assist Jev via background).
     // insertText dispara os eventos input que o editor do LinkedIn espera;
     // colagem instantânea seria detectável e não dispara os eventos do form.
+    //
+    // ANTI-THROTTLING: em aba de fundo o Chrome clampeia setTimeout em ~1s
+    // (e ~1/min após 5min oculta). Digitar 1 timer por caractere inflaria a
+    // mensagem além do JOB_TIMEOUT. Estratégia: digitar em CHUNKS (vários
+    // caracteres por timer, com cadência interna síncrona) e medir a inflação
+    // real do timer (esperado vs. decorrido) para adaptar o tamanho do chunk —
+    // o ritmo percebido pelo LinkedIn continua humano (insertText por char).
     async function typeHumanly(composer: HTMLElement, text: string, humanize: Humanize) {
       composer.focus();
       const cpsMin = humanize.type_cps_min ?? 7;
@@ -269,17 +276,45 @@ export default defineContentScript({
       const pauseMsMax = humanize.pause_ms_max ?? 1200;
 
       let nextPauseAt = randInt(pauseEveryMin, pauseEveryMax);
-      for (let i = 0; i < text.length; i++) {
-        document.execCommand("insertText", false, text[i]);
-
+      let chunkChars = 1; // começa conservador: aba visível = 1 timer/char
+      let i = 0;
+      while (i < text.length) {
         if (i >= nextPauseAt) {
-          await sleep(randInt(pauseMsMin, pauseMsMax));
+          await sleepThrottleAware(randInt(pauseMsMin, pauseMsMax));
           nextPauseAt = i + randInt(pauseEveryMin, pauseEveryMax);
-        } else {
-          const cps = cpsMin + Math.random() * (cpsMax - cpsMin);
-          await sleep(1000 / cps + Math.random() * 60);
+          continue;
         }
+
+        const chunkSize = Math.min(chunkChars, nextPauseAt - i, text.length - i);
+        const cps = cpsMin + Math.random() * (cpsMax - cpsMin);
+        const expectedMs = (1000 / cps) * chunkSize + Math.random() * 60;
+
+        const t0 = Date.now();
+        for (let c = 0; c < chunkSize; c++) {
+          document.execCommand("insertText", false, text[i + c]);
+        }
+        i += chunkSize;
+
+        const elapsed = Date.now() - t0;
+        await sleepThrottleAware(Math.max(0, expectedMs - elapsed), expectedMs, (measured) => {
+          // inflação forte (timer clampeado): mais chars por timer p/ não
+          // estourar o timeout; sem inflação: volta ao modo fino (1/char).
+          if (measured > expectedMs * 2) chunkChars = Math.min(12, chunkChars + 2);
+          else if (measured < expectedMs * 1.3 && chunkChars > 1) chunkChars = Math.max(1, chunkChars - 1);
+        });
       }
+    }
+
+    // sleep que devolve quanto tempo REALMENTE passou (para detectar clamp).
+    async function sleepThrottleAware(
+      ms: number,
+      expectedMs?: number,
+      onMeasure?: (measured: number) => void
+    ): Promise<void> {
+      const t0 = Date.now();
+      await sleep(ms);
+      if (onMeasure) onMeasure(Date.now() - t0);
+      void expectedMs;
     }
 
     async function executeOutreachJob(
@@ -290,8 +325,27 @@ export default defineContentScript({
         return { ok: false, error: "NOT_ON_PROFILE" };
       }
 
+      // Authwall/checkpoint: sem sessão válida o LinkedIn mostra o gate de
+      // login — tentar automatizar aqui só queima tentativa do job.
+      if (document.getElementById("authwall") || window.location.pathname.startsWith("/checkpoint/")) {
+        return { ok: false, error: "LINKEDIN_BLOCKED" };
+      }
+
       // 1. Botão Message (1º grau) — LinkedIn carrega as ações com atraso.
-      const btn = await waitFor(() => findMessageButton(humanize.suggested_selector), 15_000, 500);
+      let btn = await waitFor(() => findMessageButton(humanize.suggested_selector), 15_000, 500);
+      if (!btn) {
+        // Perfis que escondem "Message" atrás do dropdown "More"/"Mais":
+        // abrir o dropdown e procurar de novo antes de desistir.
+        const moreBtn = [...document.querySelectorAll<HTMLButtonElement>("button")].find((b) => {
+          const label = `${b.getAttribute("aria-label") ?? ""} ${b.innerText ?? ""}`.toLowerCase();
+          return /more|mais/.test(label) && visible(b) && !b.disabled;
+        });
+        if (moreBtn) {
+          moreBtn.click();
+          await sleep(700);
+          btn = await waitFor(() => findMessageButton(humanize.suggested_selector), 5_000, 400);
+        }
+      }
       if (!btn) return { ok: false, error: "MESSAGE_BUTTON_NOT_FOUND" };
 
       btn.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -306,7 +360,7 @@ export default defineContentScript({
         return { ok: false, error: "COMPOSER_NOT_FOUND" };
       }
 
-      // 3. Digitação humana.
+      // 3. Digitação humana (chunks anti-throttling p/ aba de fundo).
       await typeHumanly(composer, job.rendered_message, humanize);
       await sleep(randInt(500, 1200)); // revisão humana antes de enviar
 
@@ -315,13 +369,24 @@ export default defineContentScript({
       if (!sendBtn) return { ok: false, error: "SEND_BUTTON_NOT_FOUND" };
       sendBtn.click();
 
-      // 5. Verificação best-effort: composer fecha/limpa após o envio.
-      await sleep(1500);
-      if (findComposer()) {
-        // A confirmação visual não apareceu, mas o botão foi clicado — o
-        // report-sent do backend é quem confirma a entrega do job.
-        console.warn("[VibexCorp] composer ainda visível após clique em enviar");
+      // 5. Verificação REAL do envio: o composer fecha/limpa quando a mensagem
+      // sai. Se seguir visível com texto, o envio falhou — reportar erro
+      // honesto (o backend faz attempts++ e retry; nunca fingir "sent").
+      const confirmed = await waitFor(
+        () => {
+          const c = findComposer();
+          if (!c) return true; // fechou = enviado
+          const leftover = (c.textContent ?? "").trim();
+          if (leftover.length === 0) return true; // limpou = enviado
+          return null; // ainda aberto com texto: seguir esperando
+        },
+        8_000,
+        500
+      );
+      if (!confirmed) {
+        return { ok: false, error: "SEND_NOT_CONFIRMED" };
       }
+      await sleep(800); // dwell pós-envio (assentamento do toast do LinkedIn)
       return { ok: true, message_body: job.rendered_message };
     }
 

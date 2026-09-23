@@ -13,7 +13,7 @@ export default defineBackground(() => {
   const POLL_INTERVAL_MS = 5000;
   const HEARTBEAT_INTERVAL_MS = 60_000;
   const NAV_TIMEOUT_MS = 45_000;
-  const JOB_TIMEOUT_MS = 180_000;
+  const JOB_TIMEOUT_MS = 300_000; // digitação em aba de fundo é mais lenta (clamp de timer)
   const KEEPALIVE_ALARM = "vibexcorp-keepalive";
 
   let dispatching = false;
@@ -40,6 +40,16 @@ export default defineBackground(() => {
     last_sent_name: string;
     last_sent_at: string;
     last_error: string;
+    // Carimbo do último ciclo (ocioso ou não): o popup prova que o SW está
+    // vivo mesmo sem job — "nada acontecendo" vira diagnóstico legível.
+    last_cycle_at: string;
+    // Métricas de latência do Jev no último disparo (medidor do algoritmo):
+    // jev_ms = HTTP Typesafe (backend), assist_total_ms = handler completo,
+    // roundtrip_ms = ida+volta extensão→API (medido aqui).
+    last_jev_ms: number;
+    last_assist_total_ms: number;
+    last_roundtrip_ms: number;
+    last_assist_source: string;
   }
 
   const state: BgState = {
@@ -52,6 +62,11 @@ export default defineBackground(() => {
     last_sent_name: "",
     last_sent_at: "",
     last_error: "",
+    last_cycle_at: "",
+    last_jev_ms: 0,
+    last_assist_total_ms: 0,
+    last_roundtrip_ms: 0,
+    last_assist_source: "",
   };
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -107,24 +122,72 @@ export default defineBackground(() => {
     }
   }
 
+  function clearPairing() {
+    return new Promise<void>((resolve) =>
+      chrome.storage.local.remove(
+        ["extension_token", "api_jwt", "device_id", "automation_tab_id"],
+        () => resolve()
+      )
+    );
+  }
+
   async function sendHeartbeat() {
     const { extension_token } = await getAuth();
     if (!extension_token) return;
-    const { ok } = await apiFetch(
+    const { ok, status } = await apiFetch(
       "/extension/heartbeat",
       { method: "POST" },
       extension_token
     );
-    if (!ok) await recordError("heartbeat rejeitado — re-pareie a extensão");
+    if (!ok) {
+      // 401 = device revogado/expirado no banco: unpair honesto (a badge
+      // volta a SEM PAREAMENTO e o usuário re-vincula). Outros erros = só
+      // registrar (rede/5xx não invalidam o pareamento).
+      if (status === 401) {
+        await clearPairing();
+        await recordError("Pareamento revogado no servidor — vincule a extensão novamente.");
+        state.paired = false;
+        await publishState();
+        return;
+      }
+      await recordError("heartbeat falhou (API indisponível?) — re-pareie se persistir");
+    } else {
+      state.paired = true;
+      state.last_error = "";
+      await publishState();
+    }
   }
 
-  async function fetchPending(apiJwt: string) {
-    const { ok, data } = await apiFetch(
+  // Renova o api_jwt curto (60min) usando o extension_token (device, 30d).
+  // Retorna o novo JWT ou null se o device também estiver inválido (→ unpair).
+  async function renewApiJwt(): Promise<string | null> {
+    const { extension_token } = await getAuth();
+    if (!extension_token) return null;
+    const { ok, status, data } = await apiFetch(
+      "/extension/token",
+      { method: "POST" },
+      extension_token
+    );
+    if (ok && data?.api_jwt) {
+      await chrome.storage.local.set({ api_jwt: data.api_jwt });
+      return data.api_jwt as string;
+    }
+    if (status === 401) {
+      await clearPairing();
+      await recordError("Pareamento revogado no servidor — vincule a extensão novamente.");
+      state.paired = false;
+      await publishState();
+    }
+    return null;
+  }
+
+  async function fetchPending(apiJwt: string): Promise<{ ok: boolean; status: number; data: any }> {
+    const { ok, status, data } = await apiFetch(
       "/messaging/pending-outreach",
       { method: "GET" },
       apiJwt
     );
-    return ok ? data : null;
+    return { ok, status, data };
   }
 
   async function reportSent(apiJwt: string, body: Record<string, any>) {
@@ -136,9 +199,18 @@ export default defineBackground(() => {
 
   // Assist Jev (Typesafe via proxy do backend): parâmetros humanos para a
   // automação. Qualquer falha → defaults locais honestos (nunca bloqueia).
+  // Mede o round-trip (ida+volta até /assist/humanize) — medidor do
+  // algoritmo junto com jev_ms/assist_total_ms vindos do backend.
   async function assistHumanize(apiJwt: string, job: StoredJob) {
     const defaults = {
       assist_available: false,
+      source: "fallback",
+      confidence: 0,
+      page_state: "",
+      pacing_level: "",
+      jev_ms: 0,
+      assist_total_ms: 0,
+      roundtrip_ms: 0,
       click_delay_ms: randInt(700, 1400),
       type_cps_min: 7,
       type_cps_max: 12,
@@ -150,17 +222,32 @@ export default defineBackground(() => {
       suggested_selector: "",
     };
     try {
+      const t0 = Date.now();
       const { ok, data } = await apiFetch("/assist/humanize", {
         method: "POST",
         body: JSON.stringify({
           action: "send_message",
           page_fingerprint: `profile:${job.contact_id}`,
           language: "pt-BR",
+          // Seletores canônicos: o Jev escolhe o alvo correto da ação.
+          selectors: [
+            "button[aria-label*='Message']",
+            ".msg-form__contenteditable",
+            ".msg-form__send-button",
+          ],
         }),
       }, apiJwt);
-      if (!ok || !data) return defaults;
+      const roundtrip = Date.now() - t0;
+      if (!ok || !data) return { ...defaults, roundtrip_ms: roundtrip };
       return {
         assist_available: !!data.assist_available,
+        source: data.source ?? defaults.source,
+        confidence: data.confidence ?? 0,
+        page_state: data.page_state ?? "",
+        pacing_level: data.pacing_level ?? "",
+        jev_ms: data.jev_ms ?? 0,
+        assist_total_ms: data.assist_total_ms ?? 0,
+        roundtrip_ms: roundtrip,
         click_delay_ms: data.click_delay_ms ?? defaults.click_delay_ms,
         type_cps_min: data.type_cps_min ?? defaults.type_cps_min,
         type_cps_max: data.type_cps_max ?? defaults.type_cps_max,
@@ -178,13 +265,29 @@ export default defineBackground(() => {
 
   // ---------- navegação de aba ----------
 
-  async function ensureLinkedInTab(): Promise<chrome.tabs.Tab> {
-    const tabs = await chrome.tabs.query({ url: "*://*.linkedin.com/*" });
-    if (tabs.length > 0 && tabs[0]?.id != null) return tabs[0];
-    return chrome.tabs.create({
+  // Aba de automação DEDICADA: criada em background (active:false) e
+  // rastreada por id no storage. NUNCA usamos a aba que o usuário está
+  // vendo — a automação roda sem dominar o browser.
+  async function getAutomationTab(): Promise<chrome.tabs.Tab | null> {
+    const { automation_tab_id } = await chrome.storage.local.get("automation_tab_id");
+    if (automation_tab_id != null) {
+      try {
+        const tab = await chrome.tabs.get(automation_tab_id);
+        if (tab?.id != null && tab.url?.includes("linkedin.com")) return tab;
+      } catch {
+        // aba foi fechada — cai no re-criar abaixo
+      }
+    }
+    const created = await chrome.tabs.create({
       url: "https://www.linkedin.com/feed/",
-      active: true,
+      active: false,
     });
+    await chrome.storage.local.set({ automation_tab_id: created.id });
+    return created;
+  }
+
+  async function ensureLinkedInTab(): Promise<chrome.tabs.Tab | null> {
+    return getAutomationTab();
   }
 
   function navigateAndWait(
@@ -239,32 +342,70 @@ export default defineBackground(() => {
   // ---------- dispatch de um job ----------
 
   async function dispatchNextJob() {
+    // Trava ANTI-DUPLO-DESPACHO persistida no storage (sobrevive ao restart
+    // do service worker — a variável `dispatching` em memória zera quando o
+    // SW dorme/acorda, e dois ciclos podiam pegar o mesmo perfil).
+    const lockKey = "dispatch_lock";
+    const now = Date.now();
+    const lock = await new Promise<any>((resolve) =>
+      chrome.storage.local.get([lockKey], (res) => resolve(res?.[lockKey]))
+    );
+    // Lock vivo = outro ciclo ainda trabalhando (TTL = JOB_TIMEOUT + folga).
+    if (lock && now - (lock.since ?? 0) < JOB_TIMEOUT_MS + 60_000) return;
     if (dispatching) return;
+    dispatching = true;
+    await new Promise<void>((resolve) =>
+      chrome.storage.local.set({ [lockKey]: { since: now } }, () => resolve())
+    );
     const { api_jwt, outreach_paused } = await getAuth();
     state.paused = !!outreach_paused;
-    if (!api_jwt || outreach_paused) return;
+    if (!api_jwt || outreach_paused) {
+      dispatching = false;
+      await new Promise<void>((resolve) =>
+        chrome.storage.local.remove([lockKey], () => resolve())
+      );
+      // Motivo VISÍVEL no popup: ciclo parado por falta de pareamento/pausa
+      // (não é "nada acontecendo", é parado por motivo).
+      await publishState();
+      return;
+    }
+    let activeJwt = api_jwt;
 
-    dispatching = true;
     await publishState();
 
     try {
-      const pending = await fetchPending(api_jwt);
-      if (!pending) {
+      let pending = await fetchPending(api_jwt);
+      if (pending.status === 401) {
+        // api_jwt temporário venceu: renova com o extension_token e tenta 1x.
+        const renewed = await renewApiJwt();
+        if (renewed) {
+          activeJwt = renewed;
+          pending = await fetchPending(activeJwt);
+        }
+      }
+      if (!pending.ok || !pending.data) {
         await recordError("API inacessível — verifique o painel (scripts/local/start.ps1)");
         return;
       }
-      state.campaign_name = pending.has_campaign ? pending.campaign_name : "";
-      state.queue_remaining = pending.queue_remaining ?? 0;
-      state.daily_remaining = pending.daily_remaining ?? -1;
+      const data = pending.data;
+      state.campaign_name = data.has_campaign ? data.campaign_name : "";
+      state.queue_remaining = data.queue_remaining ?? 0;
+      state.daily_remaining = data.daily_remaining ?? -1;
       await publishState();
-      if (!pending.has_campaign || !pending.job) return;
+      // Sem campanha/job: registra o MOTIVO no estado (visível no popup) e
+      // libera o lock — ciclo ocioso honesto, não "travado".
+      if (!data.has_campaign || !data.job) {
+        state.last_cycle_at = new Date().toISOString();
+        await publishState();
+        return;
+      }
 
-      const job: StoredJob = pending.job;
+      const job: StoredJob = data.job;
       const recipient = job.full_name || job.first_name || "Conexão";
-      const humanize = await assistHumanize(api_jwt, job);
+      const humanize = await assistHumanize(activeJwt, job);
 
       const tab = await ensureLinkedInTab();
-      if (tab.id == null) throw new Error("NO_TAB");
+      if (!tab || tab.id == null) throw new Error("NO_TAB");
 
       // Navegação decidida aqui: a página do perfil é carregada de verdade e o
       // dispatch só segue depois do load completo (comportamento humano).
@@ -284,13 +425,26 @@ export default defineBackground(() => {
       );
 
       if (result?.ok) {
-        await reportSent(api_jwt, {
+        // Métricas de latência do Jev viajam no report: o painel exibe ms
+        // por disparo (medidor do algoritmo) junto com a auditoria.
+        state.last_jev_ms = humanize.jev_ms ?? 0;
+        state.last_assist_total_ms = humanize.assist_total_ms ?? 0;
+        state.last_roundtrip_ms = humanize.roundtrip_ms ?? 0;
+        state.last_assist_source = humanize.assist_available ? humanize.source : "fallback";
+        await reportSent(activeJwt, {
           job_id: job.job_id,
           contact_id: job.contact_id,
           recipient_name: recipient,
           message_body: result.message_body || job.rendered_message,
           linkedin_url: job.linkedin_url,
           status: "sent",
+          // Auditoria de quem guiou a automação (Jev/Typesafe vs fallback).
+          assist_source: humanize.assist_available ? humanize.source : "fallback",
+          assist_confidence: humanize.confidence ?? 0,
+          assist_page_state: humanize.page_state ?? "",
+          jev_ms: humanize.jev_ms ?? 0,
+          assist_total_ms: humanize.assist_total_ms ?? 0,
+          assist_roundtrip_ms: humanize.roundtrip_ms ?? 0,
         });
         state.last_sent_name = recipient;
         state.last_sent_at = new Date().toISOString();
@@ -301,7 +455,7 @@ export default defineBackground(() => {
       } else {
         const err = result?.error || "UNKNOWN_FAILURE";
         // Erro honesto para o backend: attempts++ e retry (3 → failed).
-        await reportSent(api_jwt, {
+        await reportSent(activeJwt, {
           job_id: job.job_id,
           contact_id: job.contact_id,
           recipient_name: recipient,
@@ -316,27 +470,59 @@ export default defineBackground(() => {
       await recordError(e?.message || "erro desconhecido no dispatch");
     } finally {
       dispatching = false;
+      state.last_cycle_at = new Date().toISOString();
+      await new Promise<void>((resolve) =>
+        chrome.storage.local.remove([lockKey], () => resolve())
+      );
       await publishState();
     }
   }
 
-  // ---------- keepalive MV3 (docs Chrome: alarms recriados no
-  // onInstalled/onStartup, listeners no top-level) ----------
+  // ---------- keepalive MV3 (docs Chrome via Context7:
+  // developer.chrome.com/docs/extensions/reference/api/alarms +
+  // .../develop/concepts/service-workers/lifecycle) ----------
+  // Regras aplicadas:
+  //   1. "alarms" declarada no manifest (wxt.config.ts) — sem ela a API não
+  //      opera e o polling morre silenciosamente.
+  //   2. persistAcrossSessions: true explícito (default só no Chrome 150+).
+  //   3. checkAlarmState no boot: o SW acorda frio e o alarme pode não
+  //      existir — recria se chrome.alarms.get retornar vazio.
+  //   4. setInterval é SÓ redundância: o SW é encerrado após ~30s de
+  //      inatividade e intervals morrem com ele; alarmes reacordam o SW.
+
+  async function ensureAlarm(): Promise<void> {
+    try {
+      const existing = await chrome.alarms.get(KEEPALIVE_ALARM);
+      if (!existing) {
+        await chrome.alarms.create(KEEPALIVE_ALARM, {
+          delayInMinutes: 1,
+          periodInMinutes: 1,
+          persistAcrossSessions: true,
+        });
+        console.log("[VibexCorp] keepalive recriado (estava ausente).");
+      }
+    } catch (e: any) {
+      console.warn("[VibexCorp] falha ao garantir keepalive:", e?.message);
+    }
+  }
 
   chrome.runtime.onInstalled.addListener(() => {
-    chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+    void ensureAlarm();
   });
 
   chrome.runtime.onStartup.addListener(() => {
-    chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+    void ensureAlarm();
   });
 
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+  void ensureAlarm();
 
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === KEEPALIVE_ALARM) {
+      // Ciclo CANÔNICO: heartbeat + dispatch vivem no alarm (sobrevive ao
+      // sleep do SW). O ensureAlarm aqui cobre o caso do alarme ter sido
+      // limpo pelo browser entre ciclos.
+      void ensureAlarm();
       sendHeartbeat();
-      // Service worker pode ter dormido: o alarm reacorda o ciclo de polling.
       dispatchNextJob();
     }
   });

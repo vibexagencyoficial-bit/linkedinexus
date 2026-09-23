@@ -655,3 +655,101 @@ Atender ao "Prossiga": reconciliar o plano (.zcode/plans, que listava A1/B2/C/D/
 ### Adendo [2026-09-23, pos-commit]
 - Teste de regressao `TestPendingOutreach_FilaVazia_200Honesto` (fila vazia -> 200 `has_campaign=false`, sem panico nil) executado verde junto a suite completa (31 testes backend PASS, vitest 13/13, tsc 0) e commitado em `a77ca16`.
 - Tree restante: so gerados/ignoraveis (`ext/vibexcorp-extension.zip` ja ignorado mas rastreado antes — manter; `frontend/tsconfig.tsbuildinfo` idem) + `graphify-out/` (1.8M, artefato) + `scripts/list/samples/` (fixtures do normalizador, pendente decisao de commit).
+
+---
+
+## Apêndice [2026-09-23] — PRD-extensao-funcional-100 (F3–F7 + F8): extensão e pipeline 100% funcionais
+
+### 1. O que foi feito
+- **F3 Extensão MV3 real:** background único cliente da API (content script sem fetch cross-origin), pipeline poll→humanize→aba→EXECUTE_OUTREACH_JOB→report-sent, keepalive por alarms (persistAcrossSessions não existe no @types/chrome 0.0.308 — alarme recriado em onInstalled/onStartup), popup sem botão fake, zip regenerado.
+- **F4/F5:** página /extension (badge real, pareamento, download, 5 passos, explicação do pipeline) e settings com limites reais (000010; slider clampado; erro honesto).
+- **F6:** upload CSV/JSON dentro de Criar Nova Campanha e Contatos (picker com contact_ids; JSON→sync-linkedin, CSV→multipart) + organizador `scripts/list/normalize.mjs` (zero deps, RFC-4180, aliases pt-BR/en, normaliza URL /in/, dedupe, "Sobrenome, Nome"; provado CSV 7→5, JSON 4→2) + README + amostras.
+- **F7 (o "banco não funciona" do usuário = 6 bugs):** header CSV com espaço; COPY FROM + RLS (0A000) no import E no sync-linkedin (ambos → pgx.Batch); heartbeat atrás de JWT (→ grupo público, auth por token_hash); panic nil-deref na fila vazia (→ scan local + guard); worker no-op (policy 000009 aplicada; diagnóstico sem tenant enxerga 0 — usar superuser postgres para diagnóstico); **cadência vazia completava contatos** (currentMessageStep ErrNoRows marcava completed na posição 1 → agora só completa com position>1; regressão TestPipeline_CadenciaVazia_NaoCompletaContatos) + decomposição de full_name nos 3 pontos de entrada (splitFullName, "Silva, Marcos" invertido).
+
+### 2. Prova E2E viva (banco 5433, ~01:33)
+heartbeat 200 → ticker 4s enfileirou 3 jobs queued com render real ("Ola Ana, vi seu trabalho na Acme...") e contatos waiting (1 despacho/org/tick) → pending-outreach 200 com job completo → report-sent recorded (job sent, posição 1→2) → cooldown 90s Redis respeitado → heartbeat expirado pausou worker (gate 2min) → WAIT roteado no tick seguinte (posição 3, +2 dias exatos). PRD §4 documenta.
+
+### 3. Descobertas de operação (evidência medida)
+1. **Diagnóstico RLS:** psql como vibex_admin sem set_config enxerga 0 linhas (FORCE RLS) — parecia "banco vazio/deletado" mas estava intacto. Diagnóstico sempre como `psql -U postgres` (initdb trust) ou com set_config.
+2. **start.ps1 pendura em foreground** (watch) — rodar em background e esperar HTTP; rebuild do binário NÃO é automático (guard Test-Path): sempre `go build -o ./bin/api.exe ./cmd/api` antes.
+3. **Panic da API aparece em D:\vibex\logs\api.log.err** (stderr), não em api.err.log.
+4. **Cooldown de 90s** (RecordExecution no report-sent) e heartbeat ≤2min são gates reais do worker ao vivo — sem heartbeat contínuo da extensão, nada enfileira (comportamento correto).
+5. **graphify . --update:** falhou 2× por infra externa do graphify (Cloudflare workers.dev 404 não-retryable no backend semântico). Débito: re-run quando voltar. AST/grafo anterior (2026-09-22) continua válido.
+6. Rota de sync é `/contacts/sync-linkedin` (não /contacts/sync); sync exige linkedin_url (dedupe por URL).
+
+### 4. Gates executados (resultado real)
+- `go vet ./...` limpo; `go test ./...` ok — 31 testes backend (nova: CadenciaVazia).
+- tsc --noEmit: frontend, packages/api-client, ext — todos exit 0 (api-client e ext via tsc do frontend: `../frontend/node_modules/.bin/tsc`).
+- `npx vitest run`: 13/13 (settings 6, extension 4, auth 3).
+- jev_decide (definition_of_done + code_review): ver relatório da sessão (chamadas reportadas ao usuário).
+
+### 5. Débitos abertos
+1. `graphify . --update` pendente (infra externa fora do ar).
+2. Enum openapi × writeAPIError: 3 códigos faltantes (carregado do apêndice anterior).
+3. Push para origin/main (rede não testada).
+4. CORS aberto em dev (débito antigo).
+
+## Apêndice [2026-09-22] — PRD-redesign-100 (R0–R6): redesign completo no tema claro + testes de uso
+
+### 1. O que foi feito
+- **R0 Jev + diagnóstico:** jev_decide(orchestration) → rota writing_plans (plano primeiro). "Extensão não funciona" do usuário: backend provado vivo (pairing→pair→heartbeat→CONNECTED 200); erro do teste manual era contrato (`pairing_code`, não `code`) + passo a passo pouco claro.
+- **R1 Design system (referência Fluxio):** tema claro único — fundo `#f4f5fa`, superfícies brancas rounded-2xl borda `#e8eaf1` sombra `0_1px_2px_rgba(15,23,42,0.04)`, acento indigo-600, inputs bg-`#f4f5fa` com foco indigo, tipografia maior (base text-sm, títulos text-2xl, KPIs text-3xl), `h-[100dvh]`. Shell novo: `Sidebar` branca (grupos GERAL/FERRAMENTAS/SUPORTE, busca, Sair, colapsável, drawer < lg), `ContextualHeader` branco (título por rota, hamburger, chip RLS, kill switch pt-BR, avatar real), `DashboardShell`.
+- **R2 Dashboard:** 4 KPIs de getDashboardMetrics (skeleton + erro honesto "Tentar novamente"); barras SVG com distribuição real; **Three.js** (`OutreachOrb`): esfera de Fibonacci 1 nó/contato (cap 160), cores por status, drag por pointer events fora do React state, prefers-reduced-motion, cleanup completo, dynamic ssr:false; card Conexões real.
+- **R3 Páginas todas no novo design:** Contatos (upload CSV/JSON preservado), Campanhas, Nova Campanha (upload+picker intactos), Flow Builder, Inbox, Templates, Atividade, Login claro. 100% pt-BR, responsivo.
+- **R4 Extensão em Configurações:** `components/settings/ExtensionSection.tsx` (status poll 3s, código real sem Math.random, download, 5 passos, pipeline); `/extension` → redirect `/settings#extensao`; saiu da sidebar.
+- **R5 Testes de uso com banco real:** novo `backend/internal/tests/usecase_test.go` — `TestUseCase_UploadCSV_Campanha_Entrega` (CSV multipart → splitFullName no servidor → campanha contact_ids → start → worker → pending com render "Ola Marina, vi voce na UsecaseCorp." → report-sent → posição 2; PASS 0.11s) e `TestUseCase_Pareamento_Extensao` (OFFLINE→pair→api_jwt do tenant→heartbeat→CONNECTED; PASS 0.07s). Novo `frontend/src/test/dashboard-honest.test.tsx` (3 testes).
+- **R6:** PRD `docs/prd/PRD-redesign-100.md`; plano 100% marcado com evidências; graphify tentado (infra externa fora — débito).
+
+### 2. Gates executados (resultado real)
+- `go vet` limpo; `go test ./...` ok (31 + 2 usecase novos).
+- tsc ×3 OK (frontend, api-client via `../../frontend/node_modules/.bin/tsc`, ext via `../frontend/...`).
+- `npx vitest run`: **16/16** (dashboard 3, settings 6, extension 4, auth 3).
+- `npx next build`: 13 rotas OK.
+- jev_decide (code_review + definition_of_done): ver relatório da sessão.
+
+### 3. Descobertas desta sessão
+1. Read de snapshot em system-reminder pode estar VELHO: sempre conferir estado real em disco (ls/Read fresh) antes de refazer trabalho — layout/shell já estavam reescritos enquanto o snapshot mostrava a versão antiga.
+2. getByText em página com KPI + barras duplica valores/rótulos ("7", "Concluídos", "Conectado") — usar getAllByText com contagem explícita.
+3. Testes de uso reutilizam helpers de `pipeline_test.go`/`cross_tenant_test.go` (liveClient/liveServer/liveToken/freshTenantOrg/seedWorkerUserAndDevice/createCampaignViaHandler/seedCampaignSteps) — org fresca por run, sem cleanup pesado.
+4. multipart para HandleImportContactsCSV: campo "file", header CSV normalizado (BOM/espaço→underscore); resposta {inserted, skipped}.
+5. next/dynamic com ssr:false em vitest: mockar o módulo do componente (stub div) evita depender de WebGL/jsdom.
+
+### 4. Débitos abertos
+1. `graphify . --update` pendente (infra externa do graphify fora do ar — Cloudflare workers.dev 404 não-retryable).
+2. Enum openapi × 3 códigos (carregado).
+3. Push para origin/main (não solicitado/testado).
+4. CORS dev aberto (antigo).
+5. imagegen-frontend-mobile sem ferramenta de geração de imagem no ambiente (princípios aplicados ao layout; limitação registrada no PRD §8).
+
+### 5. Graphify — causa raiz encontrada (2026-09-23, R6.3)
+- **Sintaxe correta:** `graphify update <path>` (subcomando), NÃO `--update` (flag inexistente — saía 0 sem fazer nada).
+- **Instalação uv quebrada:** o trampoline `graphify.exe` embute o caminho do python SEM escape — o espaço em `C:\Users\Lucas Moura` corta o caminho e o resto (`Moura\AppData\Roaming\uv\tools\graphifyy\Scripts\python.exe`) é resolvido relativo ao cwd. Mesmo erro via `graphify.exe`, caminho absoluto do exe e `python -m graphify`.
+- **Mitigação criada:** junction sem espaços `D:\vibex\tools\graphify-venv` → venv real (via PowerShell `New-Item -ItemType Junction`); `graphify-out\.graphify_python` apontado para `D:\vibex\tools\graphify-venv\Scripts\python.exe`. O entrypoint do venv continua quebrado (o pacote spawna pelo launcher), mas o venv inteiro é acessível sem espaços — base para o upstream/lançador corrigirem.
+- **Grafo atual:** `graphify-out/` de 2026-09-22 19:05 (575 nós) segue válido para a estrutura pré-redesign; redesign R1–R5 não refletido. Débito mantido.
+
+---
+
+## Apêndice R7 — Tema duplo, fix 401 e sino real (2026-09-23)
+
+### 1. Entregue
+- **Fix 401 (causa raiz React):** effects de FILHOS disparam antes do effect do PAI — o AuthProvider restaurava o token só no useEffect e o primeiro fetch do dashboard saía sem Authorization. Fix: `useState(loadSavedSession)` + `useMemo(api.setToken)` síncronos. Interceptador no api-client: todo 401 fora de `/auth/` emite `vibex:unauthorized`; o AuthProvider limpa a sessão e leva ao login (guard `redirectedRef`).
+- **Tema duplo (escuro padrão → claro):** tokens `--ov-*` + override sheet remapeando o inventário fechado de classes do painel; script anti-flash no `<head>`; toggle Sol/Lua no header no lugar da busca (removida); sidebar 248→272px com item ativo de barra lateral e card do usuário.
+- **Sino de notificações:** dropdown com eventos REAIS de `listActivity` (tabela `events` sob RLS), badge via `vibex_notifications_last_seen`, poll 10s, rótulos pt-BR por tipo, marcar lidas, vazio honesto.
+
+### 2. Bugs reais pegos pela prova visual/E2E (padrão: teste no navegador ANTES de declarar pronto)
+1. **CSS cascade (o escuro nunca aplicava):** `.dark` e `:root` têm a MESMA especificidade (0,1,0) e ambos batem no `<html>`; o `:root` claro, escrito depois, vencia sempre. Fix: `html.dark` (0,1,1). Lição: em override sheet, escurecer com seletor de especificidade maior, não só com ordem.
+2. **Worker com caixa fixa:** `step_type == "MESSAGE"` vs `"message"` salvo pela API → passo caía no ramo não-entregável e a cadência COMPLETAVA sem enfileirar nada (silencioso). Fix: `strings.EqualFold`. O builder da UI mandava maiúsculo, por isso o teste E2E original passou — contrato de API precisa ser case-insensitive onde o banco aceita dos dois jeitos.
+3. **Cast `::time` com string vazia:** campanha criada sem janela de horário → 22007/STORE_UNAVAILABLE. Fix: normalizar vazio para 00:00–23:59 no handler.
+4. **`extension_last_seen` ausente no `/dashboard/metrics`:** card dizia "Nunca conectou" com selo "Conectado". Fix: expor o campo.
+5. **Hidratação (card do usuário):** sessão do localStorage na 1ª render do cliente ≠ SSR. Fix: token SÍNCRONO (fix do 401 depende disso), perfil sobe no mount.
+6. **`next build` com dev server ativo corrompe `.next`** (`Cannot find module './261.js'`): matar dev, `rm -rf .next`, subir de novo.
+7. **Worker exige REDIS_URL com senha** (`redis://:senha@host:porta/0`) — sem rate limiter ele NÃO despacha (honesto, e o log avisa); `REDIS_ADDR` não é lido.
+
+### 3. Verificação R7
+- vitest **24/24** (8 novos: tema ×3, sino ×3, sessão/401 ×2); tsc front+client; go vet + go test (usecase E2E PASS); prova visual nos 2 temas com sino aberto e overlay de issues ZERADO.
+- E2E vivo do sino: login → contato → campanha+passo → start → pair → heartbeat → 2× `message.queued` no banco → badge "2" na UI.
+
+### 4. Padrão de prova E2E local (reutilizável)
+- Login: `POST /api/v1/auth/login` (admin@vibexcorp.com/admin123 no banco local).
+- RLS na mão: `BEGIN; SELECT set_config('app.organization_id','<org-do-auth/me>',true); ...; COMMIT;` — sem isso vibex_admin vê 0 linhas (FORCE RLS).
+- Pareamento: `POST /extension/pairing-code` → `POST /extension/pair` (64 hex) → `POST /extension/heartbeat` com Bearer do device; GATE 1 do worker exige heartbeat < 2min.

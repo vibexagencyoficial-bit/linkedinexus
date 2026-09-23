@@ -1,128 +1,167 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
 import {
-  Search,
   Building2,
   Power,
-  LogOut,
   AlertTriangle,
-  Radio,
+  Menu,
+  Moon,
+  Sun,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
+import { useTheme } from "@/lib/theme-context";
 import { api } from "@/lib/api";
+import { NotificationBell } from "@/components/layout/NotificationBell";
 
-export function ContextualHeader() {
-  const { user, logout } = useAuth();
+const PAGE_TITLES: { prefix: string; title: string }[] = [
+  { prefix: "/campaigns/new", title: "Nova Campanha" },
+  { prefix: "/campaigns", title: "Campanhas" },
+  { prefix: "/contacts", title: "Contatos" },
+  { prefix: "/inbox", title: "Mensagens" },
+  { prefix: "/templates", title: "Templates" },
+  { prefix: "/activity", title: "Atividade" },
+  { prefix: "/settings", title: "Configurações" },
+  { prefix: "/", title: "Dashboard" },
+];
+
+export function ContextualHeader({ onMenuClick }: { onMenuClick?: () => void }) {
+  const { user } = useAuth();
+  const { theme, toggleTheme } = useTheme();
+  const pathname = usePathname();
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
-  const [circuitState] = useState<"closed" | "half_open" | "open">("closed");
+
+  const pageTitle =
+    PAGE_TITLES.find((entry) =>
+      entry.prefix === "/" ? pathname === "/" : pathname.startsWith(entry.prefix)
+    )?.title ?? "Dashboard";
+
+  // Estado real do kill switch do servidor (o header é global; o valor
+  // correto não pode depender de a pausa ter sido ativada nesta sessão).
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getDashboardMetrics()
+      .then((m) => {
+        if (!cancelled) setKillSwitchActive(Boolean(m.kill_switch_active));
+      })
+      .catch(() => {
+        // Sem métricas (ex.: sem sessão), mantém o estado local honesto.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pathname]);
 
   const handleToggleKillSwitch = async () => {
-    try {
-      const nextState = !killSwitchActive;
-      await api.setGlobalKillSwitch(nextState).catch(() => null);
-      setKillSwitchActive(nextState);
-      setShowConfirmModal(false);
-    } catch {
-      // Graceful fallback
-    }
+    const nextState = !killSwitchActive;
+    await api.setGlobalKillSwitch(nextState).catch(() => null);
+    setKillSwitchActive(nextState);
+    setShowConfirmModal(false);
   };
 
   return (
     <>
-      <header className="h-14 border-b border-zinc-800/80 bg-[#0e0f12]/90 backdrop-blur-md px-5 flex items-center justify-between z-10 select-none">
-        {/* Tenant Selector & Quick Search */}
-        <div className="flex items-center space-x-4">
-          <div className="flex items-center space-x-2 px-2.5 py-1 rounded-md border border-zinc-800 bg-[#16171a] text-xs text-zinc-300 font-medium">
-            <Building2 className="w-3.5 h-3.5 text-zinc-400" />
-            <span className="font-semibold text-white">VibexCorp</span>
-            <span className="text-[10px] px-1 py-0.2 rounded bg-zinc-800 text-zinc-400 font-mono">RLS</span>
+      <header className="flex h-16 shrink-0 select-none items-center justify-between border-b border-[#e8eaf1] bg-white px-4 lg:px-6 dark:border-[#232b3d] dark:bg-[#10141f]">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={onMenuClick}
+            className="flex h-10 w-10 items-center justify-center rounded-xl text-slate-500 transition hover:bg-[#f4f5fa] hover:text-slate-700 lg:hidden dark:text-slate-400 dark:hover:bg-[#1a2132] dark:hover:text-slate-200"
+            aria-label="Abrir menu"
+          >
+            <Menu className="h-5 w-5" />
+          </button>
+          <div>
+            <h1 className="text-lg font-bold leading-tight tracking-tight text-slate-900 dark:text-slate-100">
+              {pageTitle}
+            </h1>
+            <p className="hidden text-xs text-slate-400 sm:block">
+              Painel de outreach do LinkedIn
+            </p>
           </div>
-
-          <div className="relative w-64 md:w-80">
-            <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-zinc-500" />
-            <input
-              type="text"
-              placeholder="Buscar contatos, campanhas... (Ctrl+K)"
-              className="w-full pl-8 pr-4 py-1.5 text-xs bg-[#16171a] border border-zinc-800 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-zinc-600 transition"
-            />
-          </div>
+          <span className="hidden items-center gap-1.5 rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-2.5 py-1.5 text-xs font-medium text-slate-600 md:flex dark:border-[#232b3d] dark:bg-[#0b0e17] dark:text-slate-300">
+            <Building2 className="h-3.5 w-3.5 text-slate-400" />
+            <span className="font-semibold">VibexCorp</span>
+            <span className="rounded bg-slate-200/70 px-1 font-mono text-[10px] text-slate-500 dark:bg-slate-500/20 dark:text-slate-400">
+              RLS
+            </span>
+          </span>
         </div>
 
-        {/* Operational Safety & Kill Switch & Profile */}
-        <div className="flex items-center space-x-3">
-          {/* Circuit Breaker Status Badge */}
-          <div className="hidden sm:flex items-center space-x-1.5 px-2.5 py-1 rounded-md border border-zinc-800 bg-[#141518] text-xs font-mono">
-            <Radio className={`w-3 h-3 ${circuitState === "closed" ? "text-emerald-500" : "text-amber-500"}`} />
-            <span className="text-zinc-400 text-[11px]">CB:</span>
-            <span className={`text-[11px] font-semibold uppercase ${circuitState === "closed" ? "text-emerald-400" : "text-amber-400"}`}>
-              {circuitState}
-            </span>
-          </div>
-
-          {/* GLOBAL EMERGENCY KILL SWITCH */}
+        <div className="flex items-center gap-2">
+          {/* Alternância de tema (escuro ↔ claro) — no lugar da busca removida */}
           <button
-            onClick={() => setShowConfirmModal(true)}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition shadow-sm ${
-              killSwitchActive
-                ? "bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30"
-                : "bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20"
-            }`}
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Mudar para o tema claro" : "Mudar para o tema escuro"}
+            aria-label={theme === "dark" ? "Mudar para o tema claro" : "Mudar para o tema escuro"}
+            className="flex h-10 w-10 items-center justify-center rounded-xl border border-[#e8eaf1] bg-white text-slate-500 transition hover:bg-[#f4f5fa] hover:text-slate-700 dark:border-[#232b3d] dark:bg-[#0b0e17] dark:text-slate-300 dark:hover:bg-[#1a2132]"
           >
-            <Power className="w-3.5 h-3.5" />
-            <span>{killSwitchActive ? "OUTREACH PAUSADO" : "PAUSE ALL"}</span>
+            {theme === "dark" ? <Sun className="h-[18px] w-[18px]" /> : <Moon className="h-[18px] w-[18px]" />}
           </button>
 
-          {/* User profile & Logout */}
-          <div className="flex items-center space-x-2 pl-3 border-l border-zinc-800">
-            <div className="h-7 w-7 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center text-xs font-semibold text-zinc-200">
-              {user?.name ? user.name.charAt(0).toUpperCase() : "U"}
+          <NotificationBell />
+
+          {/* Chave de segurança operacional */}
+          <button
+            onClick={() => setShowConfirmModal(true)}
+            className={`flex h-10 items-center gap-1.5 rounded-xl px-3.5 text-xs font-semibold transition ${
+              killSwitchActive
+                ? "bg-amber-50 text-amber-700 ring-1 ring-amber-200 hover:bg-amber-100 dark:bg-amber-500/10 dark:text-amber-300 dark:ring-amber-500/30 dark:hover:bg-amber-500/20"
+                : "bg-red-50 text-red-600 ring-1 ring-red-100 hover:bg-red-100 dark:bg-red-500/10 dark:text-red-300 dark:ring-red-500/30 dark:hover:bg-red-500/20"
+            }`}
+          >
+            <Power className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">
+              {killSwitchActive ? "Envios pausados" : "Pausar envios"}
+            </span>
+          </button>
+
+          {/* Perfil do usuário autenticado */}
+          <div className="flex items-center gap-3 pl-1">
+            <div className="hidden text-right leading-tight md:block">
+              <span className="block text-sm font-semibold text-slate-900 dark:text-slate-100">
+                {user?.name || "Operador"}
+              </span>
+              <span className="block text-xs text-slate-400">{user?.email || "sem sessão"}</span>
             </div>
-            <div className="hidden md:flex flex-col text-left">
-              <span className="text-xs font-medium text-zinc-200 leading-none">{user?.name || "Lucas"}</span>
-              <span className="text-[10px] text-zinc-500 leading-tight">{user?.email || "admin@vibexcorp.com"}</span>
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-indigo-600 text-sm font-bold text-white ring-2 ring-indigo-100 dark:ring-indigo-500/30">
+              {user?.name ? user.name.charAt(0).toUpperCase() : "?"}
             </div>
-            <button
-              onClick={logout}
-              title="Encerrar Sessão"
-              className="p-1.5 rounded-md text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/80 transition ml-1"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-            </button>
           </div>
         </div>
       </header>
 
-      {/* Confirmation Modal */}
+      {/* Confirmação da chave de segurança */}
       {showConfirmModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="w-full max-w-md rounded-xl border border-zinc-800 bg-[#121316] p-6 shadow-2xl text-zinc-100">
-            <div className="flex items-center space-x-3 text-red-400 mb-4">
-              <AlertTriangle className="w-6 h-6 flex-shrink-0" />
-              <h3 className="text-base font-semibold">
-                {killSwitchActive ? "Retomar Operações de Outreach?" : "Ativar Kill Switch de Emergência?"}
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-[#e8eaf1] bg-white p-6 text-slate-800 shadow-xl dark:border-[#232b3d] dark:bg-[#10141f] dark:text-slate-200">
+            <div className="mb-4 flex items-center gap-3 text-red-600 dark:text-red-300">
+              <AlertTriangle className="h-6 w-6 shrink-0" />
+              <h3 className="text-base font-bold">
+                {killSwitchActive ? "Retomar as operações de outreach?" : "Ativar a pausa global de envios?"}
               </h3>
             </div>
-            <p className="text-xs text-zinc-400 leading-relaxed mb-6">
+            <p className="mb-6 text-sm leading-relaxed text-slate-500 dark:text-slate-400">
               {killSwitchActive
-                ? "As campanhas em andamento serão retomadas e a fila do Asynq voltará a disparar mensagens para contatos elegíveis."
-                : "Todas as campanhas em andamento serão imediatamente pausadas e nenhum novo job do scheduler será enviado para as contas do LinkedIn."}
+                ? "As campanhas em andamento serão retomadas e a fila voltará a despachar mensagens para os contatos elegíveis, respeitando os limites de segurança."
+                : "Todas as campanhas em andamento serão pausadas imediatamente e nenhum novo job será despachado para as contas do LinkedIn."}
             </p>
-            <div className="flex justify-end space-x-3">
+            <div className="flex justify-end gap-3">
               <button
                 onClick={() => setShowConfirmModal(false)}
-                className="px-4 py-2 rounded-md border border-zinc-700 text-xs font-medium text-zinc-300 hover:bg-zinc-800 transition"
+                className="rounded-xl border border-[#e8eaf1] px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-50 dark:border-[#232b3d] dark:text-slate-300 dark:hover:bg-[#1a2132]"
               >
                 Cancelar
               </button>
               <button
                 onClick={handleToggleKillSwitch}
-                className={`px-4 py-2 rounded-md text-xs font-semibold text-white transition ${
+                className={`rounded-xl px-4 py-2 text-sm font-semibold text-white transition ${
                   killSwitchActive ? "bg-emerald-600 hover:bg-emerald-500" : "bg-red-600 hover:bg-red-500"
                 }`}
               >
-                {killSwitchActive ? "Confirmar Retomada" : "Confirmar Pausa Global"}
+                {killSwitchActive ? "Confirmar retomada" : "Confirmar pausa"}
               </button>
             </div>
           </div>

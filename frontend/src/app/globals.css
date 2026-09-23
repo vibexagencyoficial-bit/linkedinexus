@@ -2,51 +2,230 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ============================================================
+   VibexCorp — Tema duplo (escuro primeiro, depois claro)
+   Ordem pedida: tokens do tema ESCURO primeiro (.dark), depois
+   os do TEMA CLARO (:root, o padrão da plataforma). As utilitárias
+   do inventário do painel (border-[#e8eaf1], bg-white, bg-[#f4f5fa],
+   bg-[#f8f9fc], border-[#eef0f6], bg-[#d5d9e4]) são remapeadas por
+   variáveis de tema na camada "theme-overrides", de modo que as
+   páginas escritas para o claro funcionem nos dois temas sem alterar
+   as classes de cada componente.
+   ============================================================ */
+
 @layer base {
-  :root {
-    --background: 222 47% 6%;
-    --foreground: 210 40% 98%;
-    --card: 222 47% 9%;
-    --card-foreground: 210 40% 98%;
-    --primary: 217 91% 60%;
-    --primary-foreground: 222 47% 11%;
-    --secondary: 217 19% 18%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217 19% 15%;
+  /* --- TEMA ESCURO (base de referência, herdado do design original) ---
+     Especificidade html.dark (0,1,1) > :root (0,1,0): sem isso o bloco
+     claro, que vem depois no arquivo, venceria a cascata no mesmo <html>
+     e o tema escuro nunca aplicaria. */
+  html.dark {
+    --background: 222 47% 5%;
+    --foreground: 210 40% 96%;
+    --card: 222 41% 8%;
+    --card-foreground: 210 40% 96%;
+    --primary: 239 84% 67%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 32% 14%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 222 32% 14%;
     --muted-foreground: 215 20% 65%;
-    --accent: 217 19% 18%;
-    --accent-foreground: 210 40% 98%;
+    --accent: 239 84% 67%;
+    --accent-foreground: 226 100% 96%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 160 84% 39%;
+    --warning: 38 92% 50%;
+    --border: 222 26% 16%;
+    --input: 222 26% 16%;
+    --ring: 239 84% 67%;
+    --radius: 0.75rem;
+
+    /* Overrides do inventário de utilitárias do painel (escuro) */
+    --ov-border: #232b3d;            /* no lugar de #e8eaf1 / #eef0f6 */
+    --ov-border-soft: #1b2231;       /* no lugar de #eef0f6 */
+    --ov-surface: #10141f;           /* bg-white → cartão escuro */
+    --ov-surface-2: #0b0e17;         /* bg-[#f4f5fa] → input/fundo escuro */
+    --ov-surface-3: #141a29;         /* bg-[#f8f9fc] → cabeçalho de tabela */
+    --ov-strong: #2c3650;            /* bg-[#d5d9e4] / slate-100 sólido */
+    --ov-text: #f1f5f9;              /* slate-900 → texto principal */
+    --ov-text-body: #cbd5e1;         /* slate-600/700 */
+    --ov-text-muted: #8b96ab;        /* slate-400/500 */
+    --ov-hover: #1a2132;             /* hover:bg-slate-50 */
+    --ov-ring: rgba(99, 102, 241, 0.35);
+    --ov-scroll: #2c3650;
+    --ov-scroll-hover: #3d4a6b;
+    --ov-overlay: rgba(2, 6, 17, 0.65);
+    --ov-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  }
+
+  /* --- TEMA CLARO (padrão da plataforma) --- */
+  :root {
+    /* Referência Fluxio: fundo cinza-azulado, superfícies brancas, um acento indigo */
+    --background: 230 33% 97%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 243 100% 97%;
+    --accent-foreground: 243 75% 45%;
     --destructive: 0 72% 51%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217 19% 18%;
-    --input: 217 19% 18%;
-    --ring: 224 76% 48%;
-    --radius: 0.5rem;
+    --destructive-foreground: 0 0% 100%;
+    --success: 160 84% 39%;
+    --warning: 38 92% 50%;
+    --border: 225 22% 91%;
+    --input: 225 22% 91%;
+    --ring: 243 75% 59%;
+    --radius: 0.75rem;
+
+    /* Overrides no claro = valores originais do design */
+    --ov-border: #e8eaf1;
+    --ov-border-soft: #eef0f6;
+    --ov-surface: #ffffff;
+    --ov-surface-2: #f4f5fa;
+    --ov-surface-3: #f8f9fc;
+    --ov-strong: #d5d9e4;
+    --ov-text: #0f172a;
+    --ov-text-body: #334155;
+    --ov-text-muted: #64748b;
+    --ov-hover: #f8fafc;
+    --ov-ring: rgba(79, 70, 229, 0.18);
+    --ov-scroll: #d5d9e4;
+    --ov-scroll-hover: #b9bfd0;
+    --ov-overlay: rgba(15, 23, 42, 0.4);
+    --ov-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+
+  * {
+    border-color: var(--ov-border);
+  }
+
+  body {
+    background-color: var(--ov-surface-2);
+    color: var(--ov-text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
 }
 
-body {
-  background-color: #080c14;
-  color: #f1f5f9;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
+/* ============================================================
+   Camada de overrides: o painel foi escrito com utilitárias de
+   hex fixo no tema claro. Remapeá-las a variáveis permite os dois
+   temas sem tocar nas páginas.
+   ============================================================ */
+@layer utilities {
+  .border-\[\#e8eaf1\] { border-color: var(--ov-border) !important; }
+  .border-\[\#eef0f6\] { border-color: var(--ov-border-soft) !important; }
+  .divide-\[\#eef0f6\] > :not([hidden]) ~ :not([hidden]) { border-color: var(--ov-border-soft) !important; }
+  .border-\[\#d5d9e4\] { border-color: var(--ov-strong) !important; }
+  .border-white { border-color: var(--ov-surface) !important; }
+
+  .bg-white { background-color: var(--ov-surface) !important; }
+  .bg-\[\#f4f5fa\] { background-color: var(--ov-surface-2) !important; }
+  .bg-\[\#f8f9fc\] { background-color: var(--ov-surface-3) !important; }
+  .bg-\[\#d5d9e4\] { background-color: var(--ov-strong) !important; }
+  .hover\:bg-\[\#f8f9fc\]:hover { background-color: var(--ov-surface-3) !important; }
+  .hover\:bg-slate-50:hover { background-color: var(--ov-hover) !important; }
+  .hover\:bg-white:hover { background-color: var(--ov-surface) !important; }
+
+  /* Textos neutros do painel */
+  .text-slate-900 { color: var(--ov-text) !important; }
+  .text-slate-800 { color: var(--ov-text) !important; }
+  .text-slate-700 { color: var(--ov-text-body) !important; }
+  .text-slate-600 { color: var(--ov-text-body) !important; }
+  .text-slate-500 { color: var(--ov-text-muted) !important; }
+  .text-slate-400 { color: var(--ov-text-muted) !important; }
+  .text-slate-300 { color: var(--ov-text-muted) !important; }
+  .text-\[\#0f172a\] { color: var(--ov-text) !important; }
+  .hover\:text-slate-900:hover { color: var(--ov-text) !important; }
+  .hover\:text-slate-700:hover { color: var(--ov-text-body) !important; }
+  .hover\:text-slate-600:hover { color: var(--ov-text-body) !important; }
+
+  .bg-slate-100 { background-color: var(--ov-strong) !important; }
+  .bg-slate-200 { background-color: var(--ov-strong) !important; }
+  .bg-slate-200\/70 { background-color: color-mix(in srgb, var(--ov-strong) 70%, transparent) !important; }
+  .border-slate-200 { border-color: var(--ov-border) !important; }
+  .border-slate-300 { border-color: var(--ov-strong) !important; }
+
+  .placeholder-slate-400::placeholder { color: var(--ov-text-muted) !important; }
+  .placeholder-slate-500::placeholder { color: var(--ov-text-muted) !important; }
+
+  /* Modais: overlay e sombra temáticos */
+  .bg-slate-900\/40 { background-color: var(--ov-overlay) !important; }
+  .shadow-\[0_1px_2px_rgba\(15\,23\,42\,0\.04\)\] { box-shadow: var(--ov-shadow) !important; }
+  .shadow-\[0_1px_2px_rgba\(79\,70\,229\,0\.25\)\] { box-shadow: var(--ov-shadow) !important; }
+  .shadow-\[0_4px_24px_rgba\(15\,23\,42\,0\.08\)\] { box-shadow: 0 4px 24px rgba(0, 0, 0, 0.28) !important; }
+
+  /* Focus rings dos inputs */
+  .focus\:ring-indigo-100:focus { --tw-ring-color: var(--ov-ring) !important; }
+  .ring-indigo-100 { --tw-ring-color: var(--ov-ring) !important; }
+
+  /* Sombra do menu suspenso do sino e afins */
+  .shadow-xl { box-shadow: 0 12px 32px rgba(0, 0, 0, 0.24) !important; }
+  .shadow-2xl { box-shadow: 0 20px 48px rgba(0, 0, 0, 0.3) !important; }
+  .shadow-lg { box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2) !important; }
+
+  /* Tints de acento (badges, banners, botões secundários): no escuro viram
+     superfícies translúcidas com texto em tom claro do mesmo matiz. */
+  .dark .bg-indigo-50 { background-color: rgba(99, 102, 241, 0.14) !important; }
+  .dark .bg-indigo-50\/60 { background-color: rgba(99, 102, 241, 0.1) !important; }
+  .dark .bg-indigo-100 { background-color: rgba(99, 102, 241, 0.2) !important; }
+  .dark .text-indigo-600 { color: #a5b4fc !important; }
+  .dark .text-indigo-700 { color: #a5b4fc !important; }
+  .dark .text-indigo-900 { color: #c7d2fe !important; }
+  .dark .border-indigo-100 { border-color: rgba(99, 102, 241, 0.3) !important; }
+  .dark .border-indigo-200 { border-color: rgba(99, 102, 241, 0.35) !important; }
+  .dark .border-indigo-300 { border-color: rgba(99, 102, 241, 0.5) !important; }
+
+  .dark .bg-emerald-50 { background-color: rgba(16, 185, 129, 0.12) !important; }
+  .dark .bg-emerald-100 { background-color: rgba(16, 185, 129, 0.2) !important; }
+  .dark .text-emerald-500 { color: #34d399 !important; }
+  .dark .text-emerald-600 { color: #34d399 !important; }
+  .dark .text-emerald-700 { color: #6ee7b7 !important; }
+  .dark .text-emerald-800 { color: #6ee7b7 !important; }
+  .dark .border-emerald-100 { border-color: rgba(16, 185, 129, 0.3) !important; }
+  .dark .border-emerald-200 { border-color: rgba(16, 185, 129, 0.35) !important; }
+
+  .dark .bg-amber-50 { background-color: rgba(245, 158, 11, 0.12) !important; }
+  .dark .bg-amber-100 { background-color: rgba(245, 158, 11, 0.2) !important; }
+  .dark .text-amber-600 { color: #fbbf24 !important; }
+  .dark .text-amber-700 { color: #fcd34d !important; }
+  .dark .border-amber-100 { border-color: rgba(245, 158, 11, 0.3) !important; }
+  .dark .border-amber-200 { border-color: rgba(245, 158, 11, 0.35) !important; }
+
+  .dark .bg-red-50 { background-color: rgba(239, 68, 68, 0.12) !important; }
+  .dark .bg-red-100 { background-color: rgba(239, 68, 68, 0.2) !important; }
+  .dark .text-red-500 { color: #f87171 !important; }
+  .dark .text-red-600 { color: #f87171 !important; }
+  .dark .text-red-700 { color: #fca5a5 !important; }
+  .dark .border-red-100 { border-color: rgba(239, 68, 68, 0.3) !important; }
+  .dark .border-red-200 { border-color: rgba(239, 68, 68, 0.35) !important; }
+
+  .dark .bg-sky-50 { background-color: rgba(14, 165, 233, 0.12) !important; }
+  .dark .text-sky-600 { color: #38bdf8 !important; }
+  .dark .text-sky-700 { color: #7dd3fc !important; }
+  .dark .border-sky-100 { border-color: rgba(14, 165, 233, 0.3) !important; }
 }
 
-/* Custom scrollbar for dense enterprise tables */
+/* Scrollbar temática */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #0b0f19;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1e293b;
-  border-radius: 3px;
+  background: var(--ov-scroll);
+  border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+  background: var(--ov-scroll-hover);
 }

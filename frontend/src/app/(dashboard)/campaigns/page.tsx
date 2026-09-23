@@ -34,18 +34,18 @@ export default function CampaignsPage() {
         await api.resumeCampaign(camp.id);
       }
       await loadCampaigns();
-    } catch (err: any) {
-      alert(err?.message || "Falha ao alterar estado da campanha.");
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : "Falha ao alterar estado da campanha.");
     }
   };
 
   return (
-    <div className="space-y-6 max-w-6xl mx-auto">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-zinc-800/80">
+    <div className="mx-auto max-w-7xl space-y-5">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <h1 className="text-xl font-bold tracking-tight text-white">Campanhas de Outreach</h1>
-          <p className="text-xs text-zinc-400 mt-0.5">
-            Gerencie suas sequências de cadência, acompanhe progresso e configure regras de fluxo.
+          <h2 className="text-2xl font-bold tracking-tight text-slate-900">Campanhas de Outreach</h2>
+          <p className="mt-1 text-sm text-slate-500">
+            Gerencie suas sequências de cadência, acompanhe o progresso e configure as regras de fluxo.
           </p>
         </div>
 
@@ -53,122 +53,129 @@ export default function CampaignsPage() {
           <button
             onClick={loadCampaigns}
             title="Atualizar"
-            className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 transition"
+            className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-50 hover:text-slate-600"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin" : ""}`} />
+            <RefreshCw className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
           </button>
           <Link
             href="/campaigns/new"
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white transition shadow-sm"
+            className="flex items-center gap-2 rounded-lg bg-indigo-600 px-3.5 py-2 text-sm font-medium text-white shadow-[0_1px_2px_rgba(79,70,229,0.25)] transition hover:bg-indigo-700"
           >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Nova Campanha</span>
+            <Plus className="h-4 w-4" />
+            <span>Nova campanha</span>
           </Link>
         </div>
       </div>
 
       {isLoading ? (
-        <div className="p-16 text-center text-xs text-zinc-500 flex items-center justify-center gap-2">
-          <RefreshCw className="w-4 h-4 animate-spin text-zinc-400" />
+        <div className="flex items-center justify-center gap-2 rounded-2xl border border-[#e8eaf1] bg-white p-14 text-sm text-slate-500 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+          <RefreshCw className="h-4 w-4 animate-spin text-slate-400" />
           <span>Carregando campanhas...</span>
         </div>
       ) : campaigns.length === 0 ? (
-        /* Attio-Style Clean Empty State (Zero imaginary data) */
-        <div className="rounded-xl border border-zinc-800 bg-[#111215] p-16 flex flex-col items-center justify-center text-center space-y-3">
-          <div className="w-12 h-12 rounded-xl bg-zinc-800/50 border border-zinc-700/60 flex items-center justify-center text-zinc-400">
-            <Target className="w-6 h-6" />
+        <div className="flex flex-col items-center justify-center space-y-3 rounded-2xl border border-[#e8eaf1] bg-white p-16 text-center shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-[#e8eaf1] bg-[#f4f5fa] text-slate-400">
+            <Target className="h-7 w-7" />
           </div>
           <div className="space-y-1">
-            <h3 className="text-sm font-semibold text-white">Nenhuma campanha cadastrada</h3>
-            <p className="text-xs text-zinc-400 max-w-sm">
+            <h3 className="text-base font-semibold text-slate-900">Nenhuma campanha cadastrada</h3>
+            <p className="max-w-sm text-sm text-slate-500">
               Crie uma campanha com fluxo de cadência personalizado para disparar mensagens automáticas para suas conexões do LinkedIn.
             </p>
           </div>
           <div className="pt-2">
             <Link
               href="/campaigns/new"
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition shadow-sm"
+              className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-700"
             >
-              <Plus className="w-4 h-4" />
-              <span>Criar Primeira Campanha</span>
+              <Plus className="h-4 w-4" />
+              <span>Criar primeira campanha</span>
             </Link>
           </div>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {campaigns.map((camp) => (
             <div
               key={camp.id}
-              className="rounded-xl border border-zinc-800 bg-[#111215] p-5 space-y-4 hover:border-zinc-700 transition"
+              className="flex flex-col space-y-4 rounded-2xl border border-[#e8eaf1] bg-white p-5 shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:border-indigo-200"
             >
-              <div className="flex items-start justify-between">
+              <div className="flex items-start justify-between gap-2">
                 <div className="space-y-1">
-                  <div className="flex items-center space-x-2">
+                  <div className="flex items-center gap-2">
                     <span
-                      className={`w-2 h-2 rounded-full ${
-                        camp.status === "running" ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
+                      className={`h-2 w-2 rounded-full ${
+                        camp.status === "running" ? "animate-pulse bg-emerald-500" : "bg-amber-400"
                       }`}
                     />
-                    <h3 className="text-sm font-semibold text-white">{camp.name}</h3>
+                    <h3 className="text-base font-semibold text-slate-900">{camp.name}</h3>
                   </div>
-                  <p className="text-xs text-zinc-400 line-clamp-1">{camp.description || "Cadência automatizada"}</p>
+                  <p className="line-clamp-1 text-sm text-slate-500">
+                    {camp.description || "Cadência automatizada"}
+                  </p>
                 </div>
 
                 <span
-                  className={`px-2 py-0.5 rounded text-[10px] font-mono font-medium uppercase ${
+                  className={`rounded-full border px-2.5 py-0.5 text-xs font-medium uppercase ${
                     camp.status === "running"
-                      ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                      ? "border-emerald-100 bg-emerald-50 text-emerald-700"
                       : camp.status === "paused"
-                      ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                      : "bg-zinc-800 text-zinc-400 border border-zinc-700"
+                      ? "border-amber-100 bg-amber-50 text-amber-700"
+                      : "border-slate-200 bg-slate-100 text-slate-600"
                   }`}
                 >
-                  {camp.status}
+                  {camp.status === "running"
+                    ? "Ativa"
+                    : camp.status === "paused"
+                    ? "Pausada"
+                    : camp.status === "draft"
+                    ? "Rascunho"
+                    : camp.status}
                 </span>
               </div>
 
-              <div className="grid grid-cols-2 gap-2 text-xs font-mono text-zinc-400 bg-[#16171a] p-3 rounded-lg border border-zinc-800/80">
+              <div className="grid grid-cols-2 gap-3 rounded-xl border border-[#eef0f6] bg-[#f8f9fc] p-3.5">
                 <div>
-                  <span className="text-[10px] text-zinc-500 block">Contatos</span>
-                  <span className="text-white font-bold text-xs">{camp.total_contacts || 0} leads</span>
+                  <span className="block text-xs text-slate-400">Contatos</span>
+                  <span className="text-sm font-bold text-slate-900">{camp.total_contacts || 0} leads</span>
                 </div>
                 <div>
-                  <span className="text-[10px] text-zinc-500 block">Respostas (Stop on Reply)</span>
-                  <span className="text-emerald-400 font-bold text-xs">{camp.replied_contacts || 0} detectadas</span>
+                  <span className="block text-xs text-slate-400">Respostas (parar no reply)</span>
+                  <span className="text-sm font-bold text-emerald-600">{camp.replied_contacts || 0} detectadas</span>
                 </div>
               </div>
 
-              <div className="flex items-center justify-between pt-1">
-                <span className="text-[11px] text-zinc-500 flex items-center gap-1 font-mono">
-                  <Calendar className="w-3 h-3" />
-                  <span>{new Date(camp.created_at).toLocaleDateString()}</span>
+              <div className="mt-auto flex items-center justify-between border-t border-[#eef0f6] pt-3">
+                <span className="flex items-center gap-1.5 text-xs text-slate-400">
+                  <Calendar className="h-3.5 w-3.5" />
+                  <span>{new Date(camp.created_at).toLocaleDateString("pt-BR")}</span>
                 </span>
 
                 <div className="flex items-center gap-2">
                   {camp.status === "running" ? (
                     <button
                       onClick={() => handleTogglePause(camp)}
-                      className="px-2.5 py-1 rounded-md border border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 text-xs font-medium flex items-center gap-1 transition"
+                      className="flex items-center gap-1.5 rounded-lg border border-amber-100 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 transition hover:bg-amber-100"
                     >
-                      <Pause className="w-3 h-3" />
+                      <Pause className="h-3.5 w-3.5" />
                       <span>Pausar</span>
                     </button>
                   ) : camp.status === "paused" ? (
                     <button
                       onClick={() => handleTogglePause(camp)}
-                      className="px-2.5 py-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 text-xs font-medium flex items-center gap-1 transition"
+                      className="flex items-center gap-1.5 rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-700 transition hover:bg-emerald-100"
                     >
-                      <Play className="w-3 h-3" />
+                      <Play className="h-3.5 w-3.5" />
                       <span>Retomar</span>
                     </button>
                   ) : null}
 
                   <Link
                     href={`/campaigns/${camp.id}/builder`}
-                    className="flex items-center space-x-1 px-3 py-1 rounded-md border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-white transition"
+                    className="flex items-center gap-1.5 rounded-lg border border-[#e8eaf1] bg-white px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
                   >
-                    <span>Flow Builder</span>
-                    <ExternalLink className="w-3 h-3" />
+                    <span>Fluxo</span>
+                    <ExternalLink className="h-3.5 w-3.5" />
                   </Link>
                 </div>
               </div>

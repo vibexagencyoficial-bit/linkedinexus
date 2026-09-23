@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -201,113 +200,43 @@ func (e *MessageExecutor) ExecuteStep(
 		return ErrVariableMissing
 	}
 
-	// 7. Atomic Idempotent Execution in PostgreSQL Transaction
+	// 7. Enfileirar o job de forma IDEMPOTENTE e HONESTA. Pipeline único:
+	// a entrega real acontece na extensão Chrome do usuário — este handler
+	// NUNCA grava 'sent' nem cria conversation/message (isso é papel do
+	// /messaging/report-sent quando a extensão confirma o envio no LinkedIn).
 	idempotencyKey := ComputeIdempotencyKey(campaignID, contactID, stepID)
 
 	txErr := e.pgClient.ExecWithTenant(ctx, orgID, func(tx pgx.Tx) error {
-		// Insert job with ON CONFLICT DO NOTHING
 		var jobID uuid.UUID
 		err := tx.QueryRow(ctx, `
 			INSERT INTO message_jobs (
 				organization_id, campaign_id, contact_id, campaign_step_id,
-				idempotency_key, rendered_content, status, attempts, executed_at
-			) VALUES ($1, $2, $3, $4, $5, $6, 'sent', 1, NOW())
+				idempotency_key, rendered_content, status, attempts
+			) VALUES ($1, $2, $3, $4, $5, $6, 'queued', 0)
 			ON CONFLICT (campaign_id, contact_id, campaign_step_id) DO NOTHING
 			RETURNING id
 		`, orgID, campaignID, contactID, stepID, idempotencyKey, renderResult.RenderedText).Scan(&jobID)
 
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Job was already executed previously!
-			log.Info("job already executed deterministically (idempotency key match)", "idempotency_key", idempotencyKey)
+			// Job já enfileirado anteriormente — idempotência, não sucesso.
+			log.Info("job already queued (idempotency key match)", "idempotency_key", idempotencyKey)
 			return ErrDuplicateJob
 		}
 		if err != nil {
 			return fmt.Errorf("failed to insert message job: %w", err)
 		}
 
-		// Also record in conversation thread as outbound message
-		var convID uuid.UUID
-		err = tx.QueryRow(ctx, `
-			INSERT INTO conversations (organization_id, contact_id, linkedin_account_id, status)
-			VALUES ($1, $2, $3, 'open')
-			ON CONFLICT (organization_id, contact_id) DO UPDATE SET
-				last_message_at = NOW(),
-				updated_at = NOW()
-			RETURNING id
-		`, orgID, contactID, accountID).Scan(&convID)
-		if err != nil {
-			return fmt.Errorf("failed to upsert conversation: %w", err)
-		}
-
-		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (organization_id, conversation_id, direction, content, sent_at)
-			VALUES ($1, $2, 'outbound', $3, NOW())
-		`, orgID, convID, renderResult.RenderedText)
-		if err != nil {
-			return fmt.Errorf("failed to insert outbound message: %w", err)
-		}
-
-		// 8. Find next step to schedule
-		var nextStep StepInfo
-		err = tx.QueryRow(ctx, `
-			SELECT id, position, step_type, name, delay_amount, delay_unit
-			FROM campaign_steps
-			WHERE organization_id = $1 AND campaign_id = $2 AND position > $3
-			ORDER BY position ASC
-			LIMIT 1
-		`, orgID, campaignID, step.Position).Scan(
-			&nextStep.ID, &nextStep.Position, &nextStep.StepType, &nextStep.Name, &nextStep.DelayAmount, &nextStep.DelayUnit,
-		)
-
-		if errors.Is(err, pgx.ErrNoRows) {
-			// No more steps: Campaign is completed for this contact
-			_, err = tx.Exec(ctx, `
-				UPDATE campaign_contacts
-				SET status = 'completed',
-				    completed_at = NOW(),
-				    stop_reason = 'campaign_completed',
-				    updated_at = NOW()
-				WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
-			`, orgID, campaignID, contactID)
-			return err
-		}
-		if err != nil {
-			return fmt.Errorf("failed to query next step: %w", err)
-		}
-
-		// Calculate delay
-		var delay time.Duration
-		if nextStep.DelayUnit == "hours" {
-			delay = time.Duration(nextStep.DelayAmount) * time.Hour
-		} else {
-			delay = time.Duration(nextStep.DelayAmount) * 24 * time.Hour
-		}
-		nextExecTime := time.Now().Add(delay)
-
-		// Update campaign_contact to waiting for next execution
-		_, err = tx.Exec(ctx, `
-			UPDATE campaign_contacts
-			SET status = 'waiting',
-			    current_step_id = $4,
-			    current_position = $5,
-			    next_execution_at = $6,
-			    updated_at = NOW()
-			WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
-		`, orgID, campaignID, contactID, nextStep.ID, nextStep.Position, nextExecTime)
-		if err != nil {
-			return fmt.Errorf("failed to schedule next step: %w", err)
-		}
-
-		// 9. Insert event for real-time tracking
+		// Evento de fila para rastreamento em tempo real no painel.
 		_, err = tx.Exec(ctx, `
 			INSERT INTO events (organization_id, entity_type, entity_id, event_type, payload)
-			VALUES ($1, 'message', $2, 'message.executed', json_build_object(
+			VALUES ($1, 'message', $2, 'message.queued', json_build_object(
 				'campaign_id', $3::text,
 				'contact_id', $4::text,
+				'contact_name', $7::text,
 				'step_id', $5::text,
 				'position', $6::int
 			))
-		`, orgID, jobID, campaignID, contactID, stepID, step.Position)
+		`, orgID, jobID, campaignID, contactID, stepID, step.Position, contact.FullName)
 
 		return err
 	})
@@ -320,11 +249,10 @@ func (e *MessageExecutor) ExecuteStep(
 		return txErr
 	}
 
-	// Record execution in rate limiter and circuit breaker
-	_ = e.rateLimiter.RecordExecution(ctx, accountID)
-	e.safetyService.GetCircuitBreaker(accountID).RecordSuccess()
-	telemetry.IncJobsSucceeded()
+	// NÃO registrar execução no rate limiter nem sucesso no circuit breaker:
+	// enfileirar não é entregar. O registro real acontece no report-sent
+	// (API), quando a extensão confirma o envio.
 
-	log.Info("message step executed successfully", "idempotency_key", idempotencyKey)
+	log.Info("message job queued for extension delivery", "idempotency_key", idempotencyKey)
 	return nil
 }

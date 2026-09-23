@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import {
   Sparkles,
   ArrowRight,
-  Clock,
   CheckCircle2,
   Workflow,
   Users,
@@ -62,7 +61,7 @@ export default function NewCampaignPage() {
 
     const ext = file.name.toLowerCase().split(".").pop();
     if (ext !== "csv" && ext !== "json") {
-      setImportMsg({ ok: false, text: "Formato não suportado — use .csv ou .json (organize com scripts/list/normalize.mjs)." });
+      setImportMsg({ ok: false, text: "Formato não suportado — use .csv ou .json." });
       return;
     }
 
@@ -71,7 +70,7 @@ export default function NewCampaignPage() {
     try {
       const res = await api.importContactsFile(file);
       const n = res.inserted ?? res.imported ?? res.synced ?? 0;
-      setImportMsg({ ok: true, text: `✓ ${n} contatos importados de ${file.name} — confira abaixo.` });
+      setImportMsg({ ok: true, text: `${n} contatos importados de ${file.name} — confira abaixo.` });
       loadContacts();
     } catch (err: unknown) {
       setImportMsg({
@@ -118,7 +117,7 @@ export default function NewCampaignPage() {
         contact_ids: Array.from(selectedIds),
       });
 
-      // If user chose recommended template, initialize recommended flow steps
+      // Se o usuário escolheu o template recomendado, inicializa o fluxo padrão.
       if (useRecommendedTemplate) {
         await api.saveCampaignSteps(res.id, [
           {
@@ -183,25 +182,25 @@ export default function NewCampaignPage() {
       }
 
       router.push(`/campaigns/${res.id}/builder`);
-    } catch (err: any) {
-      alert("Erro ao criar campanha: " + (err?.message || ""));
+    } catch (err: unknown) {
+      alert("Erro ao criar campanha: " + (err instanceof Error ? err.message : ""));
       setIsCreating(false);
     }
   };
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="mx-auto max-w-3xl space-y-5">
       <div>
-        <h1 className="text-xl font-bold tracking-tight text-white">Criar Nova Campanha de Outreach</h1>
-        <p className="text-xs text-zinc-400 mt-0.5">
-          Configure sua cadência, defina o fluxo de mensagens e selecione os limites operacionais.
+        <h2 className="text-2xl font-bold tracking-tight text-slate-900">Criar nova campanha</h2>
+        <p className="mt-1 text-sm text-slate-500">
+          Configure a cadência, defina o fluxo de mensagens e selecione os limites operacionais.
         </p>
       </div>
 
-      <form onSubmit={handleCreate} className="rounded-xl border border-zinc-800 bg-[#111215] p-6 space-y-5">
+      <form onSubmit={handleCreate} className="space-y-6 rounded-2xl border border-[#e8eaf1] bg-white p-6 shadow-[0_1px_2px_rgba(15,23,42,0.04)] lg:p-8">
         <div>
-          <label className="block text-xs font-semibold text-zinc-300 mb-1.5">
-            Nome da Campanha *
+          <label className="mb-1.5 block text-sm font-semibold text-slate-700">
+            Nome da campanha *
           </label>
           <input
             type="text"
@@ -209,48 +208,48 @@ export default function NewCampaignPage() {
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="Ex: Prospecção de Diretores de Tecnologia e Growth"
-            className="w-full px-3 py-2 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
+            className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3.5 py-2.5 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
           />
         </div>
 
         <div>
-          <label className="block text-xs font-semibold text-zinc-300 mb-1.5">
-            Descrição do Objetivo (Opcional)
+          <label className="mb-1.5 block text-sm font-semibold text-slate-700">
+            Descrição do objetivo (opcional)
           </label>
           <textarea
             rows={2}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             placeholder="Ex: Cadência de follow-up com 2 etapas e stop on reply imediato para conexões do LinkedIn."
-            className="w-full px-3 py-2 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
+            className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3.5 py-2.5 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
           />
         </div>
 
-        {/* Cadence Flow Choice (Spec Section 18) */}
+        {/* Escolha do fluxo inicial (Spec seção 18) */}
         <div>
-          <label className="block text-xs font-semibold text-zinc-300 mb-2">
-            Modelo de Fluxo Inicial
+          <label className="mb-2 block text-sm font-semibold text-slate-700">
+            Modelo de fluxo inicial
           </label>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <button
               type="button"
               onClick={() => setUseRecommendedTemplate(true)}
-              className={`p-3.5 rounded-lg border text-left transition ${
+              className={`rounded-xl border p-4 text-left transition ${
                 useRecommendedTemplate
-                  ? "border-indigo-500/60 bg-indigo-950/20 text-white"
-                  : "border-zinc-800 bg-[#16171a] text-zinc-400 hover:border-zinc-700"
+                  ? "border-indigo-400 bg-indigo-50/60 ring-2 ring-indigo-100"
+                  : "border-[#e8eaf1] bg-white hover:border-slate-300"
               }`}
             >
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-xs font-semibold text-white flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+              <div className="mb-1 flex items-center justify-between">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-slate-900">
+                  <Sparkles className="h-4 w-4 text-indigo-600" />
                   <span>VibexCorp Standard</span>
                 </span>
-                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-indigo-500/10 text-indigo-300">
+                <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-medium text-indigo-700">
                   Recomendado
                 </span>
               </div>
-              <p className="text-[11px] text-zinc-400 leading-snug">
+              <p className="text-sm leading-snug text-slate-500">
                 Cadência padrão de 3 etapas com verificação Stop on Reply entre envios.
               </p>
             </button>
@@ -258,41 +257,41 @@ export default function NewCampaignPage() {
             <button
               type="button"
               onClick={() => setUseRecommendedTemplate(false)}
-              className={`p-3.5 rounded-lg border text-left transition ${
+              className={`rounded-xl border p-4 text-left transition ${
                 !useRecommendedTemplate
-                  ? "border-indigo-500/60 bg-indigo-950/20 text-white"
-                  : "border-zinc-800 bg-[#16171a] text-zinc-400 hover:border-zinc-700"
+                  ? "border-indigo-400 bg-indigo-50/60 ring-2 ring-indigo-100"
+                  : "border-[#e8eaf1] bg-white hover:border-slate-300"
               }`}
             >
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-xs font-semibold text-white flex items-center gap-1.5">
-                  <Workflow className="w-3.5 h-3.5 text-zinc-400" />
-                  <span>Fluxo em Branco</span>
+              <div className="mb-1 flex items-center justify-between">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-slate-900">
+                  <Workflow className="h-4 w-4 text-slate-400" />
+                  <span>Fluxo em branco</span>
                 </span>
               </div>
-              <p className="text-[11px] text-zinc-400 leading-snug">
-                Construa sua própria sequência do zero no Flow Builder interativo.
+              <p className="text-sm leading-snug text-slate-500">
+                Construa sua própria sequência do zero no construtor de fluxo interativo.
               </p>
             </button>
           </div>
         </div>
 
         {/* Lista de contatos: checkboxes, todos marcados por padrão */}
-        <div className="pt-2 border-t border-zinc-800/80">
-          <div className="flex items-center justify-between mb-2">
-            <label className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
-              <Users className="w-3.5 h-3.5 text-zinc-500" />
-              <span>Contatos desta Cadência</span>
+        <div className="border-t border-[#eef0f6] pt-5">
+          <div className="mb-2 flex items-center justify-between">
+            <label className="flex items-center gap-1.5 text-sm font-semibold text-slate-700">
+              <Users className="h-4 w-4 text-slate-400" />
+              <span>Contatos desta cadência</span>
             </label>
             <div className="flex items-center gap-3">
-              <span className="text-[10px] font-mono text-zinc-500">
+              <span className="text-xs text-slate-400">
                 {selectedIds.size} de {contacts.length} selecionados
               </span>
               {contacts.length > 0 && (
                 <button
                   type="button"
                   onClick={toggleAll}
-                  className="text-[10px] text-indigo-400 hover:text-indigo-300 transition"
+                  className="text-xs font-medium text-indigo-600 transition hover:text-indigo-700"
                 >
                   {selectedIds.size === contacts.length ? "Desmarcar todos" : "Marcar todos"}
                 </button>
@@ -301,7 +300,7 @@ export default function NewCampaignPage() {
           </div>
 
           {/* Upload CSV/JSON aqui dentro — importa e já entra na seleção */}
-          <div className="flex items-center gap-2 mb-2.5">
+          <div className="mb-2.5 flex flex-wrap items-center gap-2">
             <input
               ref={fileInputRef}
               type="file"
@@ -313,16 +312,16 @@ export default function NewCampaignPage() {
               type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={isImporting}
-              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-zinc-700 bg-zinc-800/60 text-xs font-medium text-zinc-200 hover:text-white hover:bg-zinc-800 transition disabled:opacity-60"
+              className="flex items-center gap-2 rounded-lg border border-[#e8eaf1] bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:bg-slate-50 disabled:opacity-60"
             >
               {isImporting ? (
-                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                <RefreshCw className="h-4 w-4 animate-spin" />
               ) : (
-                <Upload className="w-3.5 h-3.5" />
+                <Upload className="h-4 w-4" />
               )}
-              <span>{isImporting ? "Importando..." : "Fazer Upload de Lista (CSV ou JSON)"}</span>
+              <span>{isImporting ? "Importando..." : "Fazer upload de lista (CSV ou JSON)"}</span>
             </button>
-            <span className="text-[10px] text-zinc-500">
+            <span className="text-xs text-slate-400">
               lista do Google Sheets, Apollo, planilha — qualquer origem
             </span>
           </div>
@@ -331,17 +330,17 @@ export default function NewCampaignPage() {
           {importMsg && (
             <div
               role="status"
-              className={`mb-2.5 px-3 py-2 rounded-lg border text-xs flex items-center justify-between ${
+              className={`mb-2.5 flex items-center justify-between rounded-lg border px-3.5 py-2.5 text-sm ${
                 importMsg.ok
-                  ? "border-emerald-500/30 bg-emerald-950/20 text-emerald-300"
-                  : "border-red-500/30 bg-red-950/20 text-red-300"
+                  ? "border-emerald-100 bg-emerald-50 text-emerald-700"
+                  : "border-red-100 bg-red-50 text-red-600"
               }`}
             >
-              <span className="font-mono break-all">{importMsg.text}</span>
+              <span className="break-all">{importMsg.text}</span>
               <button
                 type="button"
                 onClick={() => setImportMsg(null)}
-                className="ml-3 text-[10px] opacity-70 hover:opacity-100 flex-shrink-0"
+                className="ml-3 flex-shrink-0 text-xs opacity-70 transition hover:opacity-100"
               >
                 fechar
               </button>
@@ -349,34 +348,34 @@ export default function NewCampaignPage() {
           )}
 
           {contactsError ? (
-            <div className="rounded-lg border border-red-500/30 bg-red-950/20 p-2.5 text-[11px] text-red-300 flex items-center gap-2">
-              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
-              <span className="font-mono break-all">{contactsError}</span>
+            <div className="flex items-center gap-2 rounded-lg border border-red-100 bg-red-50 p-3 text-sm text-red-600">
+              <AlertCircle className="h-4 w-4 flex-shrink-0" />
+              <span className="break-all">{contactsError}</span>
             </div>
           ) : contacts.length === 0 ? (
-            <div className="rounded-lg border border-dashed border-zinc-800 bg-[#141518] p-3 text-[11px] text-zinc-400">
+            <div className="rounded-xl border border-dashed border-[#d5d9e4] bg-[#f8f9fc] p-4 text-sm text-slate-500">
               Nenhum contato cadastrado ainda. Use o botão acima para importar sua lista (CSV ou JSON) — depois de importar, os contatos aparecem aqui já selecionados.
             </div>
           ) : (
-            <div className="rounded-lg border border-zinc-800 bg-[#0f1012] max-h-48 overflow-y-auto divide-y divide-zinc-800/60">
+            <div className="max-h-56 divide-y divide-[#eef0f6] overflow-y-auto rounded-xl border border-[#e8eaf1] bg-white">
               {contacts.map((c) => (
                 <label
                   key={c.id}
-                  className="flex items-center gap-2.5 px-3 py-2 hover:bg-zinc-900/50 cursor-pointer transition"
+                  className="flex cursor-pointer items-center gap-3 px-4 py-2.5 transition hover:bg-[#f8f9fc]"
                 >
                   <input
                     type="checkbox"
                     checked={selectedIds.has(c.id)}
                     onChange={() => toggleContact(c.id)}
-                    className="w-3.5 h-3.5 accent-indigo-500"
+                    className="h-4 w-4 rounded accent-indigo-600"
                   />
-                  <span className="text-xs text-zinc-200 font-medium truncate flex-1">
+                  <span className="flex-1 truncate text-sm font-medium text-slate-700">
                     {c.full_name || `${c.first_name} ${c.last_name}`}
                   </span>
-                  <span className="text-[10px] text-zinc-500 truncate max-w-[140px]">
+                  <span className="max-w-[140px] truncate text-xs text-slate-400">
                     {c.company || "—"}
                   </span>
-                  <span className="text-[10px] font-mono text-zinc-600 uppercase">
+                  <span className="text-xs font-medium uppercase text-slate-400">
                     {c.status}
                   </span>
                 </label>
@@ -385,60 +384,60 @@ export default function NewCampaignPage() {
           )}
         </div>
 
-        {/* Limits & Hours */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-zinc-800/80">
+        {/* Limites e horários */}
+        <div className="grid grid-cols-1 gap-3 border-t border-[#eef0f6] pt-5 sm:grid-cols-3">
           <div>
-            <label className="block text-xs font-semibold text-zinc-300 mb-1">Limite Diário</label>
+            <label className="mb-1 block text-sm font-semibold text-slate-700">Limite diário</label>
             <input
               type="number"
               min="5"
               max="50"
               value={dailyLimit}
               onChange={(e) => setDailyLimit(parseInt(e.target.value) || 30)}
-              className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white font-mono focus:outline-none focus:border-indigo-500"
+              className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3.5 py-2.5 text-sm text-slate-900 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
             />
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-zinc-300 mb-1">Início</label>
+            <label className="mb-1 block text-sm font-semibold text-slate-700">Início</label>
             <input
               type="time"
               value={allowedStart}
               onChange={(e) => setAllowedStart(e.target.value)}
-              className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white font-mono focus:outline-none focus:border-indigo-500"
+              className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3.5 py-2.5 text-sm text-slate-900 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
             />
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-zinc-300 mb-1">Fim</label>
+            <label className="mb-1 block text-sm font-semibold text-slate-700">Fim</label>
             <input
               type="time"
               value={allowedEnd}
               onChange={(e) => setAllowedEnd(e.target.value)}
-              className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white font-mono focus:outline-none focus:border-indigo-500"
+              className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3.5 py-2.5 text-sm text-slate-900 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
             />
           </div>
         </div>
 
-        <div className="flex items-center justify-between pt-3">
+        <div className="flex items-center justify-between border-t border-[#eef0f6] pt-5">
           {/* Sem contato marcado o backend entenderia "todos" — bloqueamos e
               avisamos, em vez de cadastrar uma cadência com escopo errado. */}
           {contacts.length > 0 && selectedIds.size === 0 && (
-            <span className="text-[11px] text-amber-400">
+            <span className="text-sm text-amber-600">
               Selecione ao menos um contato (ou cadastre contatos depois).
             </span>
           )}
           <button
             type="submit"
             disabled={isCreating || (contacts.length > 0 && selectedIds.size === 0)}
-            className="ml-auto flex items-center space-x-1.5 px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition shadow-sm disabled:opacity-50"
+            className="ml-auto flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-[0_1px_2px_rgba(79,70,229,0.25)] transition hover:bg-indigo-700 disabled:opacity-50"
           >
             {isCreating ? (
-              <span>Criando Campanha...</span>
+              <span>Criando campanha...</span>
             ) : (
               <>
-                <span>Prosseguir para Flow Builder</span>
-                <ArrowRight className="w-3.5 h-3.5" />
+                <span>Prosseguir para o fluxo</span>
+                <ArrowRight className="h-4 w-4" />
               </>
             )}
           </button>

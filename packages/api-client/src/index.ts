@@ -13,6 +13,8 @@ export interface User {
 
 export interface LoginResponse {
   token: string;
+  refresh_token?: string;
+  expires_in?: number;
   user: User;
 }
 
@@ -28,6 +30,10 @@ export interface DashboardMetrics {
   extension_last_seen?: string | null;
   linkedin_connected?: boolean;
   linkedin_status?: string;
+  // Métrica do Jev: média de jev_ms nos message.sent recentes + amostras.
+  // Ausente/0 amostras = vazio honesto (nunca 0ms inventado).
+  jev_avg_ms?: number | null;
+  jev_samples?: number;
 }
 
 export interface LinkedInAccount {
@@ -84,6 +90,10 @@ export interface HumanizeParams {
   suggested_selector?: string;
   page_state?: string;
   confidence?: number;
+  pacing_level?: string;
+  jev_ms?: number;
+  assist_total_ms?: number;
+  cached?: boolean;
 }
 
 export interface Contact {
@@ -227,6 +237,12 @@ export interface ReportSentRequest {
   status?: string;
   job_id?: string;
   error?: string;
+  assist_source?: string;
+  assist_confidence?: number;
+  assist_page_state?: string;
+  jev_ms?: number;
+  assist_total_ms?: number;
+  assist_roundtrip_ms?: number;
 }
 
 export interface ConversationMessage {
@@ -239,6 +255,7 @@ export interface ConversationMessage {
 
 export interface ConversationItem {
   id: string;
+  contact_id?: string;
   leadName: string;
   company: string;
   jobTitle: string;
@@ -253,6 +270,7 @@ export interface ConversationItem {
 export class VibexApiClient {
   private baseUrl: string;
   private token: string | null = null;
+  private refreshInFlight: Promise<string | null> | null = null;
 
   constructor(baseUrl: string = 'http://localhost:8080/api/v1') {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -262,7 +280,53 @@ export class VibexApiClient {
     this.token = token;
   }
 
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  // Access tokens são TEMPORÁRIOS (15min): em 401, renovamos com o refresh
+  // token (7d, rotacionado no banco) e repetimos a request 1x — sem logout
+  // a cada 15 minutos.
+  private getRefreshToken(): string | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      return localStorage.getItem('vibex_refresh_token');
+    } catch {
+      return null;
+    }
+  }
+
+  private storeSession(token?: string, refreshToken?: string) {
+    if (typeof window === 'undefined') return;
+    try {
+      if (token) localStorage.setItem('vibex_auth_token', token);
+      if (refreshToken) localStorage.setItem('vibex_refresh_token', refreshToken);
+    } catch {
+      /* storage indisponível */
+    }
+  }
+
+  private async tryRefresh(): Promise<string | null> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    this.refreshInFlight = (async () => {
+      const rt = this.getRefreshToken();
+      if (!rt) return null;
+      const res = await fetch(`${this.baseUrl}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: rt }),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { token?: string; refresh_token?: string };
+      if (!data.token) return null;
+      this.token = data.token;
+      this.storeSession(data.token, data.refresh_token);
+      return data.token;
+    })();
+    try {
+      return await this.refreshInFlight;
+    } finally {
+      this.refreshInFlight = null;
+    }
+  }
+
+  private async request<T>(path: string, options: RequestInit = {}, retried = false): Promise<T> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
@@ -279,11 +343,26 @@ export class VibexApiClient {
     });
 
     if (!res.ok) {
+      // 401 com refresh disponível: renova e repete UMA vez antes de derrubar
+      // a sessão (rota de auth não se renova a si mesma).
+      if (res.status === 401 && !retried && !path.startsWith('/auth/')) {
+        const newToken = await this.tryRefresh().catch(() => null);
+        if (newToken) {
+          return this.request<T>(path, options, true);
+        }
+      }
       const errBody = await res.json().catch(() => ({ error: { message: res.statusText } }));
       // Contrato honesto: propaga code + message + details para a UI exibir
       // o erro real (A1/D); ApiError carrega o status HTTP (401/404/428/503).
       const code = errBody?.error?.code || `HTTP_${res.status}`;
       const msg = errBody?.error?.message || errBody?.error || `HTTP ${res.status}: ${res.statusText}`;
+      // 401 definitivo (sem refresh possível): evento global para a app limpar
+      // a sessão e levar ao login (o próprio /auth/login não emite o evento).
+      if (res.status === 401 && !path.startsWith('/auth/')) {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('vibex:unauthorized', { detail: { code, message: msg } }));
+        }
+      }
       throw new ApiError(code, msg, res.status, errBody?.error?.details);
     }
 
@@ -403,6 +482,9 @@ export class VibexApiClient {
       const errBody = await res.json().catch(() => ({ error: { message: res.statusText } }));
       const code = errBody?.error?.code || `HTTP_${res.status}`;
       const msg = errBody?.error?.message || `HTTP ${res.status}: ${res.statusText}`;
+      if (res.status === 401 && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('vibex:unauthorized', { detail: { code, message: msg } }));
+      }
       throw new ApiError(code, msg, res.status, errBody?.error?.details);
     }
     return res.json() as Promise<{ inserted?: number; imported?: number; skipped?: number; status?: string }>;

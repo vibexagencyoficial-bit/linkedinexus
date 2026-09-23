@@ -79,12 +79,17 @@ func (p *LinkedInProvider) ExecuteEligibleAction(ctx context.Context, action *El
 		return nil, fmt.Errorf("action cannot be nil")
 	}
 
-	// Respect platform safety rules (Section 30: Do not insist on platform errors)
+	// Pipeline único honesto: este backend NÃO fala com a API do LinkedIn.
+	// A entrega real acontece na extensão Chrome (sessão do próprio usuário).
+	// Qualquer chamada aqui é um erro — nunca mais fingir sucesso com
+	// ExternalID fabricado.
 	return &ExecutionResult{
-		Success:    true,
-		ExternalID: fmt.Sprintf("li_msg_%d", time.Now().UnixNano()),
-		ExecutedAt: time.Now(),
-	}, nil
+		Success:       false,
+		ExecutedAt:    time.Now(),
+		ErrorCategory: "NOT_SUPPORTED",
+		ErrorMessage:  "delivery happens through the paired Chrome extension, not a server-side LinkedIn API",
+		StopContact:   false,
+	}, fmt.Errorf("linkedin provider does not deliver server-side; use the extension pipeline")
 }
 
 func (p *LinkedInProvider) SyncState(ctx context.Context, accountID uuid.UUID) error {

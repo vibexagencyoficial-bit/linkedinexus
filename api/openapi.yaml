@@ -485,6 +485,23 @@ paths:
                 error:
                   type: string
                   description: Não vazio = falha na entrega → retry (3 tentativas)
+                assist_source:
+                  type: string
+                  enum: [typesafe, fallback]
+                  description: Quem guiou a automação (auditoria do Jev)
+                assist_confidence:
+                  type: number
+                assist_page_state:
+                  type: string
+                jev_ms:
+                  type: integer
+                  description: HTTP puro à Typesafe em ms (0 = cache/fallback)
+                assist_total_ms:
+                  type: integer
+                  description: Handler /assist/humanize completo em ms
+                assist_roundtrip_ms:
+                  type: integer
+                  description: Ida+volta extensão→API em ms (medido na extensão)
       responses:
         '200':
           description: recorded | retry_scheduled | failed_stopped | already_recorded
@@ -606,6 +623,11 @@ components:
         scroll_dwell_ms: { type: integer }
         suggested_selector: { type: string }
         page_state: { type: string }
+        confidence: { type: number }
+        pacing_level: { type: string, enum: [conservative, moderate, energetic] }
+        jev_ms: { type: integer, description: 'HTTP puro à Typesafe em ms (0 = cache/fallback)' }
+        assist_total_ms: { type: integer, description: 'Handler completo em ms' }
+        cached: { type: boolean, description: 'Resposta veio do cache (jev_ms=0 esperado)' }
         confidence: { type: number }
     DailyLimits:
       type: object
@@ -735,6 +757,21 @@ components:
           type: integer
         kill_switch_active:
           type: boolean
+        extension_connected:
+          type: boolean
+        extension_last_seen:
+          type: string
+          format: date-time
+          nullable: true
+        linkedin_connected:
+          type: boolean
+        jev_avg_ms:
+          type: number
+          nullable: true
+          description: Latência média do Jev em ms nos message.sent das últimas 24h (nulo = sem amostras)
+        jev_samples:
+          type: integer
+          description: Nº de disparos com métrica de Jev nas últimas 24h
 
     Contact:
       type: object

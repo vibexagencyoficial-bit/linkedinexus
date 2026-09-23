@@ -27,6 +27,8 @@ vi.mock("@/lib/api", () => ({
     getDailyLimits: mocks.getDailyLimits,
     saveDailyLimits: mocks.saveDailyLimits,
   },
+  // A seção da extensão (agora dentro de settings) consome esta URL:
+  EXTENSION_DOWNLOAD_URL: "http://localhost:8080/api/v1/downloads/extension.zip",
 }));
 
 import SettingsPage from "@/app/(dashboard)/settings/page";
@@ -61,10 +63,10 @@ describe("A1 — settings honesta quando a API falha", () => {
     render(<SettingsPage />);
 
     await waitFor(() => {
-      expect(screen.getByText("NOT CONNECTED")).toBeTruthy();
+      expect(screen.getByText("DESCONECTADA")).toBeTruthy();
     });
     // Badge NÃO pode virar CONNECTED por fabricação:
-    expect(screen.queryByText("CONNECTED")).toBeNull();
+    expect(screen.queryByText("CONECTADA")).toBeNull();
     // Caixa de erro da conta com a mensagem real:
     expect(screen.getByText("Falha ao conectar a conta LinkedIn")).toBeTruthy();
     // Mensagem real do erro chega à UI (o hífen da mensagem é renderizado
@@ -91,17 +93,17 @@ describe("A1 — settings honesta quando a API falha", () => {
     render(<SettingsPage />);
 
     await waitFor(() => {
-      expect(screen.getByText("NOT CONNECTED")).toBeTruthy();
+      expect(screen.getByText("DESCONECTADA")).toBeTruthy();
     });
-    fireEvent.click(screen.getByText("Conectar LinkedIn (1 Clique)"));
+    fireEvent.click(screen.getByText("Conectar via Extensão (1 clique)"));
 
     await waitFor(() => {
       expect(mocks.connectAccount).toHaveBeenCalled();
     });
     await waitFor(() => {
-      expect(screen.getByText("NOT CONNECTED")).toBeTruthy();
+      expect(screen.getByText("DESCONECTADA")).toBeTruthy();
     });
-    expect(screen.queryByText("Perfil Conectado")).toBeNull();
+    expect(screen.queryByText("Perfil conectado")).toBeNull();
     expect(
       screen.getByText(/STORE_UNAVAILABLE: postgres offline/i)
     ).toBeTruthy();
@@ -125,7 +127,7 @@ describe("F1 — limites diários vindos do backend (sem cosmético)", () => {
     await waitFor(() => {
       expect(screen.getByText("42 ações / dia")).toBeTruthy();
     });
-    expect(screen.getByText("Teto Backend: 50 msg/dia")).toBeTruthy();
+    expect(screen.getByText("Teto: 50/dia")).toBeTruthy();
   });
 
   it("falha ao carregar limites mostra o erro real (nada fabricado)", async () => {
@@ -153,15 +155,15 @@ describe("F1 — limites diários vindos do backend (sem cosmético)", () => {
     render(<SettingsPage />);
 
     await waitFor(() => {
-      expect(screen.getByText("Salvar Configurações")).toBeTruthy();
+      expect(screen.getByText("Salvar configurações")).toBeTruthy();
     });
-    fireEvent.click(screen.getByText("Salvar Configurações"));
+    fireEvent.click(screen.getByText("Salvar configurações"));
 
     await waitFor(() => {
       expect(mocks.saveDailyLimits).toHaveBeenCalled();
     });
     // Contrato honesto: nenhum feedback de sucesso sem persistência real.
-    expect(screen.queryByText("Configurações Salvas")).toBeNull();
+    expect(screen.queryByText("Configurações salvas")).toBeNull();
     await waitFor(() => {
       expect(screen.getByText("Falha nos limites de envio")).toBeTruthy();
     });

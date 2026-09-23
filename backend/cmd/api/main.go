@@ -66,7 +66,9 @@ func main() {
 
 	extensionZip := os.Getenv("EXTENSION_ZIP_PATH")
 
-	authService := auth.NewService(jwtSecret, 72*time.Hour)
+	// Access tokens são TEMPORÁRIOS: painel 15min, extensão 60min (TTLs
+	// explícitos por emissão). O default do serviço é o teto do painel.
+	authService := auth.NewService(jwtSecret, 15*time.Minute)
 	safetyService := safety.NewPlatformSafetyService()
 	broker := events.NewBroker()
 

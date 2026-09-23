@@ -2,12 +2,30 @@ package api
 
 import (
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 )
+
+// corsAllowedOrigins: allowlist explícita (env CORS_ALLOWED_ORIGINS, vírgula)
+// + origens chrome-extension://. SEM wildcard: o "return true" antigo anulava
+// toda a whitelist.
+func corsAllowedOrigins() []string {
+	def := "http://localhost:3001,http://localhost:3000"
+	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); strings.TrimSpace(v) != "" {
+		def = v
+	}
+	out := []string{}
+	for _, o := range strings.Split(def, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			out = append(out, o)
+		}
+	}
+	return out
+}
 
 func (s *Server) SetupRouter() *chi.Mux {
 	r := chi.NewRouter()
@@ -18,20 +36,29 @@ func (s *Server) SetupRouter() *chi.Mux {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Restrictive CORS with functional origin matching for Chrome Extensions
+	// Rate limit global (por IP): 120 req/min; buckets mais duros nas rotas
+	// sensíveis abaixo.
+	r.Use(s.rateLimitMiddleware(bucketGlobal))
+
+	allowed := corsAllowedOrigins()
 	r.Use(cors.Handler(cors.Options{
 		AllowOriginFunc: func(r *http.Request, origin string) bool {
-			// Permite qualquer origem de extensão Chrome ou localhost do Next.js
-			if strings.HasPrefix(origin, "chrome-extension://") ||
-				strings.HasPrefix(origin, "http://localhost") ||
-				strings.HasPrefix(origin, "https://localhost") {
+			// Extensões Chrome têm origem própria (chrome-extension://<id>) —
+			// permitidas por scheme; painéis só da allowlist.
+			if strings.HasPrefix(origin, "chrome-extension://") {
 				return true
 			}
-			return true // Modo dev: autoriza requisições da extensão e do dashboard
+			for _, a := range allowed {
+				if origin == a {
+					return true
+				}
+			}
+			return false
 		},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Request-ID", "X-Organization-ID"},
-		AllowCredentials: true,
+		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		// X-Organization-ID removido: tenant vem SOMENTE do JWT (nunca de header).
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Request-ID"},
+		AllowCredentials: false, // tokens vão no header Authorization, sem cookies
 		MaxAge:           300,
 	}))
 
@@ -45,21 +72,27 @@ func (s *Server) SetupRouter() *chi.Mux {
 	r.Route("/api/v1", func(r chi.Router) {
 		// Public Auth & Pairing (NOTA Fase D: /auth/demo-token removido —
 		// emissor de JWT sem credencial; pareamento é só via /extension/pair)
-		r.Post("/auth/login", s.HandleLogin)
+		// Buckets anti-brute-force: login 10/min/IP, pair 5/10min/IP
+		// (código de 8 hex = 4 bi combinações; sem teto, é quebrável online).
+		r.With(s.rateLimitMiddleware(bucketLogin)).Post("/auth/login", s.HandleLogin)
 		r.Post("/auth/logout", s.HandleLogout)
-		r.Post("/extension/pair", s.HandlePairExtension)
-		// Heartbeat autentica pelo token do device (token_hash), NÃO por JWT:
-		// ficar no grupo protegido rejeitava o heartbeat real da extensão.
-		r.Post("/extension/heartbeat", s.HandleExtensionHeartbeat)
+		r.With(s.rateLimitMiddleware(bucketPair)).Post("/extension/pair", s.HandlePairExtension)
+		// Heartbeat e renovação autenticam pelo token do device (token_hash),
+		// NÃO por JWT: no grupo protegido seriam rejeitados.
+		r.With(s.rateLimitMiddleware(bucketHeartbeat)).Post("/extension/heartbeat", s.HandleExtensionHeartbeat)
+		r.With(s.rateLimitMiddleware(bucketHeartbeat)).Post("/extension/token", s.HandleExtensionToken)
+		// Refresh é PÚBLICO e autentica pelo refresh_token (sessão DB-backed):
+		// dentro do grupo com Middleware, o access expirado seria rejeitado
+		// antes de chegar ao handler e a renovação nunca funcionaria.
+		r.With(s.rateLimitMiddleware(bucketLogin)).Post("/auth/refresh", s.HandleRefreshDB)
 		r.Post("/templates/preview", s.HandleTemplatePreview)
 
 		// Protected Routes
 		r.Group(func(r chi.Router) {
 			r.Use(s.authService.Middleware)
 
-			// Auth Context
+			// Auth Context (/auth/refresh é público — rota acima).
 			r.Get("/auth/me", s.HandleMe)
-			r.Post("/auth/refresh", s.HandleRefresh)
 
 			// SSE Stream
 			r.Get("/events/stream", s.broker.StreamHandler)
@@ -73,9 +106,9 @@ func (s *Server) SetupRouter() *chi.Mux {
 			r.Post("/accounts/connect", s.HandleConnectAccount)
 			r.Post("/accounts/disconnect", s.HandleDisconnectAccount)
 
-			// Browser Extension
-			r.Post("/extension/pairing-code", s.HandleGeneratePairingCode)
-			r.Get("/extension/status", s.HandleExtensionStatus)
+		// Browser Extension
+		r.With(s.rateLimitMiddleware(bucketPairingCode)).Post("/extension/pairing-code", s.HandleGeneratePairingCode)
+		r.Get("/extension/status", s.HandleExtensionStatus)
 
 			// Contacts
 			r.Get("/contacts", s.HandleListContacts)

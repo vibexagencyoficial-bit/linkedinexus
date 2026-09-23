@@ -8,12 +8,37 @@ import {
   RefreshCw,
   ExternalLink,
   Users,
-  CheckCircle2,
   Trash2,
   Linkedin,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Contact } from "@vibexcorp/api-client";
+
+const FILTERS = [
+  { id: "all", label: "Todos" },
+  { id: "waiting", label: "Aguardando disparo" },
+  { id: "contacted", label: "Mensagem enviada" },
+  { id: "replied", label: "Responderam" },
+  { id: "completed", label: "Concluídos" },
+];
+
+function statusBadge(status: string) {
+  if (status === "replied")
+    return "bg-emerald-50 text-emerald-700 border-emerald-100";
+  if (status === "contacted")
+    return "bg-indigo-50 text-indigo-700 border-indigo-100";
+  if (status === "waiting")
+    return "bg-amber-50 text-amber-700 border-amber-100";
+  if (status === "active") return "bg-sky-50 text-sky-700 border-sky-100";
+  return "bg-slate-100 text-slate-600 border-slate-200";
+}
+
+function statusLabel(status: string) {
+  if (status === "contacted") return "Mensagem enviada";
+  if (status === "waiting") return "Aguardando disparo";
+  if (status === "replied") return "Respondeu";
+  return status;
+}
 
 export default function ContactsPage() {
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -22,11 +47,11 @@ export default function ContactsPage() {
   const [activeFilter, setActiveFilter] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
 
-  // Modals
+  // Modais
   const [showAddModal, setShowAddModal] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
 
-  // New Contact Form
+  // Formulário de novo contato
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [company, setCompany] = useState("");
@@ -34,7 +59,7 @@ export default function ContactsPage() {
   const [linkedinUrl, setLinkedinUrl] = useState("");
   const [isSaving, setIsSaving] = useState(false);
 
-  // Quick Sync Form (Real LinkedIn Connections)
+  // Sync rápido (conexões reais do LinkedIn)
   const [syncBatchText, setSyncBatchText] = useState("");
   const [isSyncing, setIsSyncing] = useState(false);
 
@@ -51,7 +76,7 @@ export default function ContactsPage() {
 
     const ext = file.name.toLowerCase().split(".").pop();
     if (ext !== "csv" && ext !== "json") {
-      setImportMsg({ ok: false, text: "Formato não suportado — use .csv ou .json (veja scripts/list/normalize.mjs)." });
+      setImportMsg({ ok: false, text: "Formato não suportado — use .csv ou .json." });
       return;
     }
 
@@ -60,7 +85,7 @@ export default function ContactsPage() {
     try {
       const res = await api.importContactsFile(file);
       const n = res.inserted ?? res.imported ?? res.synced ?? 0;
-      setImportMsg({ ok: true, text: `✓ ${n} contatos importados de ${file.name}.` });
+      setImportMsg({ ok: true, text: `${n} contatos importados de ${file.name}.` });
       await loadContacts();
     } catch (err: unknown) {
       setImportMsg({
@@ -122,8 +147,8 @@ export default function ContactsPage() {
       setJobTitle("");
       setLinkedinUrl("");
       await loadContacts();
-    } catch (err: any) {
-      alert(err?.message || "Erro ao salvar contato.");
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : "Erro ao salvar contato.");
     } finally {
       setIsSaving(false);
     }
@@ -132,7 +157,7 @@ export default function ContactsPage() {
   const handleSyncRealConnections = async () => {
     setIsSyncing(true);
     try {
-      // Parse manual or extension list of connections
+      // Parse manual da lista de conexões colada pelo operador.
       const lines = syncBatchText.split("\n").filter((l) => l.trim().length > 0);
       const parsed = lines.map((line) => {
         const parts = line.split(",").map((p) => p.trim());
@@ -152,8 +177,8 @@ export default function ContactsPage() {
       setShowSyncModal(false);
       setSyncBatchText("");
       await loadContacts();
-    } catch (err: any) {
-      alert("Erro ao sincronizar conexões: " + (err?.message || ""));
+    } catch (err: unknown) {
+      alert("Erro ao sincronizar conexões: " + (err instanceof Error ? err.message : ""));
     } finally {
       setIsSyncing(false);
     }
@@ -169,17 +194,17 @@ export default function ContactsPage() {
   };
 
   return (
-    <div className="space-y-4">
-      {/* Top Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+    <div className="mx-auto max-w-7xl space-y-5">
+      {/* Cabeçalho da página */}
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <h1 className="text-xl font-bold tracking-tight text-white">Contatos & Conexões</h1>
-          <p className="text-xs text-zinc-400 mt-0.5">
-            Base de dados unificada com deduplicação nativa por URL do LinkedIn.
+          <h2 className="text-2xl font-bold tracking-tight text-slate-900">Contatos & Conexões</h2>
+          <p className="mt-1 text-sm text-slate-500">
+            Base unificada com deduplicação nativa por URL do LinkedIn.
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <input
             ref={fileInputRef}
             type="file"
@@ -190,30 +215,30 @@ export default function ContactsPage() {
           <button
             onClick={() => fileInputRef.current?.click()}
             disabled={isImporting}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-zinc-700 bg-zinc-800/60 text-xs font-medium text-zinc-200 hover:text-white hover:bg-zinc-800 transition disabled:opacity-60"
+            className="flex items-center gap-2 rounded-lg border border-[#e8eaf1] bg-white px-3.5 py-2 text-sm font-medium text-slate-700 shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:bg-slate-50 disabled:opacity-60"
           >
             {isImporting ? (
-              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              <RefreshCw className="h-4 w-4 animate-spin" />
             ) : (
-              <Upload className="w-3.5 h-3.5" />
+              <Upload className="h-4 w-4" />
             )}
             <span>{isImporting ? "Importando..." : "Importar CSV/JSON"}</span>
           </button>
 
           <button
             onClick={() => setShowSyncModal(true)}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-[#0077b5]/30 bg-[#0077b5]/10 text-xs font-medium text-[#38bdf8] hover:bg-[#0077b5]/20 transition"
+            className="flex items-center gap-2 rounded-lg border border-sky-100 bg-sky-50 px-3.5 py-2 text-sm font-medium text-sky-700 transition hover:bg-sky-100"
           >
-            <Linkedin className="w-3.5 h-3.5" />
-            <span>Sincronizar Conexões LinkedIn</span>
+            <Linkedin className="h-4 w-4" />
+            <span>Sincronizar conexões</span>
           </button>
 
           <button
             onClick={() => setShowAddModal(true)}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white transition shadow-sm"
+            className="flex items-center gap-2 rounded-lg bg-indigo-600 px-3.5 py-2 text-sm font-medium text-white shadow-[0_1px_2px_rgba(79,70,229,0.25)] transition hover:bg-indigo-700"
           >
-            <UserPlus className="w-3.5 h-3.5" />
-            <span>Novo Contato</span>
+            <UserPlus className="h-4 w-4" />
+            <span>Novo contato</span>
           </button>
         </div>
       </div>
@@ -222,50 +247,44 @@ export default function ContactsPage() {
       {importMsg && (
         <div
           role="status"
-          className={`px-3 py-2 rounded-lg border text-xs flex items-center justify-between ${
+          className={`flex items-center justify-between rounded-xl border px-4 py-2.5 text-sm ${
             importMsg.ok
-              ? "border-emerald-500/30 bg-emerald-950/20 text-emerald-300"
-              : "border-red-500/30 bg-red-950/20 text-red-300"
+              ? "border-emerald-100 bg-emerald-50 text-emerald-700"
+              : "border-red-100 bg-red-50 text-red-600"
           }`}
         >
-          <span className="font-mono break-all">{importMsg.text}</span>
+          <span className="break-all">{importMsg.text}</span>
           <button
             onClick={() => setImportMsg(null)}
-            className="ml-3 text-[10px] opacity-70 hover:opacity-100 flex-shrink-0"
+            className="ml-3 flex-shrink-0 text-xs opacity-70 transition hover:opacity-100"
           >
             fechar
           </button>
         </div>
       )}
 
-      {/* Filter and Search Bar */}
-      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-2.5 rounded-lg border border-zinc-800 bg-[#111215]">
-        <div className="relative w-full sm:w-72">
-          <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-zinc-500" />
+      {/* Busca e filtros */}
+      <div className="flex flex-col gap-3 rounded-2xl border border-[#e8eaf1] bg-white p-3 shadow-[0_1px_2px_rgba(15,23,42,0.04)] sm:flex-row sm:items-center sm:justify-between">
+        <div className="relative w-full sm:w-80">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <input
             type="text"
-            placeholder="Filtrar por nome ou empresa..."
+            placeholder="Buscar por nome ou empresa..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-8 pr-3 py-1.5 text-xs bg-[#16171a] border border-zinc-800 rounded-md text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-700"
+            className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] py-2 pl-9 pr-3 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
           />
         </div>
 
-        <div className="flex items-center space-x-1.5 w-full sm:w-auto overflow-x-auto">
-          {[
-            { id: "all", label: "Todos" },
-            { id: "waiting", label: "Aguardando Disparo" },
-            { id: "contacted", label: "Mensagem Enviada" },
-            { id: "replied", label: "Responderam" },
-            { id: "completed", label: "Concluídos" },
-          ].map((tab) => (
+        <div className="flex w-full items-center gap-1 overflow-x-auto sm:w-auto">
+          {FILTERS.map((tab) => (
             <button
               key={tab.id}
               onClick={() => setActiveFilter(tab.id)}
-              className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
+              className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium transition ${
                 activeFilter === tab.id
-                  ? "bg-zinc-800 text-white"
-                  : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40"
+                  ? "bg-indigo-50 text-indigo-700"
+                  : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
               }`}
             >
               {tab.label}
@@ -274,150 +293,139 @@ export default function ContactsPage() {
           <button
             onClick={loadContacts}
             title="Atualizar"
-            className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 transition"
+            className="ml-1 rounded-lg p-2 text-slate-400 transition hover:bg-slate-50 hover:text-slate-600"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin" : ""}`} />
+            <RefreshCw className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
           </button>
         </div>
       </div>
 
-      {/* Floating Batch Action Toolbar */}
+      {/* Barra de ação em lote */}
       {selectedIds.length > 0 && (
-        <div className="flex items-center justify-between px-4 py-2 rounded-lg border border-indigo-500/30 bg-indigo-950/20 text-xs text-indigo-200">
+        <div className="flex items-center justify-between rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-2.5 text-sm text-indigo-700">
           <span>{selectedIds.length} contato(s) selecionado(s)</span>
           <button
             onClick={handleDeleteSelected}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-600/80 hover:bg-red-600 text-white transition text-xs"
+            className="flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-red-700"
           >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Remover Selecionados</span>
+            <Trash2 className="h-4 w-4" />
+            <span>Remover selecionados</span>
           </button>
         </div>
       )}
 
-      {/* Contacts Table (Attio high density) */}
-      <div className="rounded-xl border border-zinc-800 bg-[#111215] overflow-hidden">
+      {/* Tabela de contatos */}
+      <div className="overflow-hidden rounded-2xl border border-[#e8eaf1] bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
         {isLoading ? (
-          <div className="p-12 text-center text-xs text-zinc-500 flex items-center justify-center gap-2">
-            <RefreshCw className="w-4 h-4 animate-spin text-zinc-400" />
-            <span>Carregando contatos reais...</span>
+          <div className="flex items-center justify-center gap-2 p-14 text-sm text-slate-500">
+            <RefreshCw className="h-4 w-4 animate-spin text-slate-400" />
+            <span>Carregando contatos...</span>
           </div>
         ) : contacts.length === 0 ? (
-          /* Attio-Style Clean Empty State (Zero imaginary data) */
-          <div className="p-16 flex flex-col items-center justify-center text-center space-y-3">
-            <div className="w-12 h-12 rounded-xl bg-zinc-800/50 border border-zinc-700/60 flex items-center justify-center text-zinc-400">
-              <Users className="w-6 h-6" />
+          <div className="flex flex-col items-center justify-center space-y-3 p-16 text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-[#e8eaf1] bg-[#f4f5fa] text-slate-400">
+              <Users className="h-7 w-7" />
             </div>
             <div className="space-y-1">
-              <h3 className="text-sm font-semibold text-white">Nenhum contato encontrado</h3>
-              <p className="text-xs text-zinc-400 max-w-sm">
-                Sua base de dados está pronta. Cadastre contatos manualmente ou sincronize diretamente as conexões do seu LinkedIn.
+              <h3 className="text-base font-semibold text-slate-900">Nenhum contato encontrado</h3>
+              <p className="max-w-sm text-sm text-slate-500">
+                Cadastre contatos manualmente, importe um arquivo CSV/JSON ou sincronize as conexões do seu LinkedIn.
               </p>
             </div>
             <div className="flex items-center gap-2 pt-2">
               <button
                 onClick={() => setShowSyncModal(true)}
-                className="px-3.5 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white transition shadow-sm"
+                className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700"
               >
-                Sincronizar Conexões
+                Sincronizar conexões
               </button>
               <button
                 onClick={() => setShowAddModal(true)}
-                className="px-3.5 py-1.5 rounded-md border border-zinc-700 bg-zinc-800/60 text-xs font-medium text-zinc-300 hover:text-white transition"
+                className="rounded-lg border border-[#e8eaf1] bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
               >
-                Adicionar Contato Manual
+                Adicionar manualmente
               </button>
             </div>
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs text-zinc-300">
-              <thead className="bg-[#141518] text-[11px] uppercase tracking-wider text-zinc-400 font-mono border-b border-zinc-800">
+            <table className="w-full text-left text-sm text-slate-600">
+              <thead className="border-b border-[#e8eaf1] bg-[#f8f9fc] text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th className="p-3 w-8">
+                  <th className="w-10 p-4">
                     <input
                       type="checkbox"
                       checked={selectedIds.length === contacts.length && contacts.length > 0}
                       onChange={toggleSelectAll}
-                      className="rounded accent-indigo-500"
+                      className="rounded accent-indigo-600"
                     />
                   </th>
-                  <th className="p-3">Nome Completo</th>
-                  <th className="p-3">Empresa</th>
-                  <th className="p-3">Cargo</th>
-                  <th className="p-3">Status</th>
-                  <th className="p-3">LinkedIn URL</th>
-                  <th className="p-3">Ações / Inbox</th>
-                  <th className="p-3 text-right">Cadastrado em</th>
+                  <th className="p-4">Nome</th>
+                  <th className="p-4">Empresa</th>
+                  <th className="p-4">Cargo</th>
+                  <th className="p-4">Status</th>
+                  <th className="p-4">LinkedIn</th>
+                  <th className="p-4">Mensagens</th>
+                  <th className="p-4 text-right">Cadastrado em</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-zinc-800/60">
+              <tbody className="divide-y divide-[#eef0f6]">
                 {contacts.map((c) => (
                   <tr
                     key={c.id}
-                    className={`hover:bg-zinc-800/30 transition-colors ${
-                      selectedIds.includes(c.id) ? "bg-indigo-950/10" : ""
+                    className={`transition-colors hover:bg-[#f8f9fc] ${
+                      selectedIds.includes(c.id) ? "bg-indigo-50/50" : ""
                     }`}
                   >
-                    <td className="p-3">
+                    <td className="p-4">
                       <input
                         type="checkbox"
                         checked={selectedIds.includes(c.id)}
                         onChange={() => toggleSelect(c.id)}
-                        className="rounded accent-indigo-500"
+                        className="rounded accent-indigo-600"
                       />
                     </td>
-                    <td className="p-3 font-medium text-white">{c.full_name || `${c.first_name} ${c.last_name}`}</td>
-                    <td className="p-3 text-zinc-300">{c.company || "—"}</td>
-                    <td className="p-3 text-zinc-400">{c.job_title || "—"}</td>
-                    <td className="p-3">
+                    <td className="p-4 font-semibold text-slate-900">
+                      {c.full_name || `${c.first_name} ${c.last_name}`}
+                    </td>
+                    <td className="p-4">{c.company || "—"}</td>
+                    <td className="p-4">{c.job_title || "—"}</td>
+                    <td className="p-4">
                       <span
-                        className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-medium ${
-                          c.status === "replied"
-                            ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                            : c.status === "contacted"
-                            ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
-                            : c.status === "waiting"
-                            ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                            : c.status === "active"
-                            ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
-                            : "bg-zinc-800 text-zinc-400"
-                        }`}
+                        className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium ${statusBadge(c.status)}`}
                       >
-                        {c.status === "contacted"
-                          ? "Mensagem Enviada"
-                          : c.status === "waiting"
-                          ? "Aguardando Disparo"
-                          : c.status === "replied"
-                          ? "Respondeu"
-                          : c.status}
+                        {statusLabel(c.status)}
                       </span>
                     </td>
-                    <td className="p-3">
+                    <td className="p-4">
                       <a
                         href={c.linkedin_url}
                         target="_blank"
                         rel="noreferrer"
-                        className="text-indigo-400 hover:underline flex items-center gap-1 font-mono text-[11px]"
+                        className="flex items-center gap-1 text-indigo-600 hover:underline"
                       >
-                        <span className="truncate max-w-[140px]">{c.linkedin_url.replace("https://linkedin.com/in/", "").replace("https://www.linkedin.com/in/", "")}</span>
-                        <ExternalLink className="w-3 h-3 flex-shrink-0" />
+                        <span className="max-w-[140px] truncate">
+                          {c.linkedin_url
+                            .replace("https://linkedin.com/in/", "")
+                            .replace("https://www.linkedin.com/in/", "")}
+                        </span>
+                        <ExternalLink className="h-3.5 w-3.5 flex-shrink-0" />
                       </a>
                     </td>
-                    <td className="p-3">
-                      {(c.status === "contacted" || c.status === "replied") ? (
+                    <td className="p-4">
+                      {c.status === "contacted" || c.status === "replied" ? (
                         <a
                           href="/inbox"
-                          className="inline-flex items-center gap-1 text-[11px] text-indigo-400 hover:text-indigo-300 font-medium"
+                          className="font-medium text-indigo-600 transition hover:text-indigo-700"
                         >
-                          <span>💬 Ver na Inbox</span>
+                          Ver na caixa de entrada
                         </a>
                       ) : (
-                        <span className="text-[10px] text-zinc-500 font-mono">Fila de espera</span>
+                        <span className="text-slate-400">Aguardando fila</span>
                       )}
                     </td>
-                    <td className="p-3 text-right font-mono text-zinc-500">
-                      {new Date(c.created_at).toLocaleDateString()}
+                    <td className="p-4 text-right text-slate-400">
+                      {new Date(c.created_at).toLocaleDateString("pt-BR")}
                     </td>
                   </tr>
                 ))}
@@ -427,68 +435,68 @@ export default function ContactsPage() {
         )}
       </div>
 
-      {/* Modal: Novo Contato */}
+      {/* Modal: novo contato */}
       {showAddModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="w-full max-w-md rounded-xl border border-zinc-800 bg-[#121316] p-6 shadow-2xl text-zinc-100 space-y-4">
-            <h3 className="text-sm font-semibold text-white">Cadastrar Novo Contato</h3>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md space-y-4 rounded-2xl border border-[#e8eaf1] bg-white p-6 shadow-2xl">
+            <h3 className="text-base font-semibold text-slate-900">Cadastrar novo contato</h3>
 
             <form onSubmit={handleCreateContact} className="space-y-3">
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-medium text-zinc-400 mb-1">Primeiro Nome</label>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">Primeiro nome</label>
                   <input
                     type="text"
                     required
                     value={firstName}
                     onChange={(e) => setFirstName(e.target.value)}
                     placeholder="Marcos"
-                    className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white focus:outline-none focus:border-indigo-500"
+                    className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-zinc-400 mb-1">Sobrenome</label>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">Sobrenome</label>
                   <input
                     type="text"
                     value={lastName}
                     onChange={(e) => setLastName(e.target.value)}
-                    placeholder="Dardi"
-                    className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white focus:outline-none focus:border-indigo-500"
+                    placeholder="Silva"
+                    className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-zinc-400 mb-1">Empresa</label>
+                <label className="mb-1 block text-sm font-medium text-slate-600">Empresa</label>
                 <input
                   type="text"
                   value={company}
                   onChange={(e) => setCompany(e.target.value)}
                   placeholder="VibexCorp"
-                  className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white focus:outline-none focus:border-indigo-500"
+                  className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-zinc-400 mb-1">Cargo</label>
+                <label className="mb-1 block text-sm font-medium text-slate-600">Cargo</label>
                 <input
                   type="text"
                   value={jobTitle}
                   onChange={(e) => setJobTitle(e.target.value)}
-                  placeholder="Head of Growth"
-                  className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white focus:outline-none focus:border-indigo-500"
+                  placeholder="Head de Growth"
+                  className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-zinc-400 mb-1">URL do LinkedIn *</label>
+                <label className="mb-1 block text-sm font-medium text-slate-600">URL do LinkedIn *</label>
                 <input
                   type="url"
                   required
                   value={linkedinUrl}
                   onChange={(e) => setLinkedinUrl(e.target.value)}
                   placeholder="https://linkedin.com/in/nome-usuario"
-                  className="w-full px-3 py-1.5 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white font-mono focus:outline-none focus:border-indigo-500"
+                  className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] px-3 py-2 font-mono text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
                 />
               </div>
 
@@ -496,16 +504,16 @@ export default function ContactsPage() {
                 <button
                   type="button"
                   onClick={() => setShowAddModal(false)}
-                  className="px-3 py-1.5 rounded-md border border-zinc-700 text-xs font-medium text-zinc-300 hover:bg-zinc-800 transition"
+                  className="rounded-lg border border-[#e8eaf1] bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
                   disabled={isSaving}
-                  className="px-4 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition disabled:opacity-50"
+                  className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:opacity-50"
                 >
-                  {isSaving ? "Salvando..." : "Salvar Contato"}
+                  {isSaving ? "Salvando..." : "Salvar contato"}
                 </button>
               </div>
             </form>
@@ -513,33 +521,35 @@ export default function ContactsPage() {
         </div>
       )}
 
-      {/* Modal: Sincronizar Conexões Reais */}
+      {/* Modal: sincronizar conexões reais */}
       {showSyncModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="w-full max-w-lg rounded-xl border border-zinc-800 bg-[#121316] p-6 shadow-2xl text-zinc-100 space-y-4">
-            <div className="flex items-center space-x-3 text-white">
-              <div className="w-8 h-8 rounded-lg bg-[#0077b5]/10 border border-[#0077b5]/30 flex items-center justify-center text-[#0077b5]">
-                <Linkedin className="w-4 h-4" />
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-lg space-y-4 rounded-2xl border border-[#e8eaf1] bg-white p-6 shadow-2xl">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-600">
+                <Linkedin className="h-5 w-5" />
               </div>
               <div>
-                <h3 className="text-sm font-semibold">Sincronizar Conexões do LinkedIn</h3>
-                <p className="text-xs text-zinc-400">Importação em lote de conexões de 1º grau para outreach.</p>
+                <h3 className="text-base font-semibold text-slate-900">Sincronizar conexões do LinkedIn</h3>
+                <p className="text-sm text-slate-500">
+                  Importação em lote de conexões de 1º grau para outreach.
+                </p>
               </div>
             </div>
 
             <div className="space-y-2">
-              <label className="block text-xs font-medium text-zinc-300">
-                Cole linhas de conexões (Formato: Nome, Empresa, Cargo, URL) ou sincronize automaticamente via Extensão:
+              <label className="block text-sm font-medium text-slate-600">
+                Cole as conexões (formato: Nome, Empresa, Cargo, URL) ou sincronize automaticamente pela extensão:
               </label>
               <textarea
                 rows={5}
                 value={syncBatchText}
                 onChange={(e) => setSyncBatchText(e.target.value)}
-                placeholder="Exemplo:&#10;Lucas Silva, VibexCorp, CTO, https://linkedin.com/in/lucas-silva&#10;Mariana Costa, Fintech Inc, VP de Vendas, https://linkedin.com/in/mariana-costa"
-                className="w-full p-3 text-xs bg-[#18191c] border border-zinc-800 rounded-md text-white font-mono focus:outline-none focus:border-indigo-500"
+                placeholder={"Exemplo:\nLucas Silva, VibexCorp, CTO, https://linkedin.com/in/lucas-silva\nMariana Costa, Fintech Inc, VP de Vendas, https://linkedin.com/in/mariana-costa"}
+                className="w-full rounded-lg border border-[#e8eaf1] bg-[#f4f5fa] p-3 font-mono text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
               />
-              <span className="text-[10px] text-zinc-500 block">
-                Ao utilizar a extensão de navegador, suas conexões são capturadas diretamente da página de conexões do LinkedIn com 1 clique.
+              <span className="block text-xs text-slate-400">
+                Com a extensão do navegador instalada, suas conexões são capturadas diretamente da página de conexões do LinkedIn em 1 clique (veja Configurações &gt; Extensão).
               </span>
             </div>
 
@@ -547,7 +557,7 @@ export default function ContactsPage() {
               <button
                 type="button"
                 onClick={() => setShowSyncModal(false)}
-                className="px-3 py-1.5 rounded-md border border-zinc-700 text-xs font-medium text-zinc-300 hover:bg-zinc-800 transition"
+                className="rounded-lg border border-[#e8eaf1] bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
               >
                 Fechar
               </button>
@@ -555,9 +565,9 @@ export default function ContactsPage() {
                 type="button"
                 disabled={isSyncing || !syncBatchText.trim()}
                 onClick={handleSyncRealConnections}
-                className="px-4 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition disabled:opacity-50"
+                className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:opacity-50"
               >
-                {isSyncing ? "Sincronizando..." : "Sincronizar Conexões"}
+                {isSyncing ? "Sincronizando..." : "Sincronizar conexões"}
               </button>
             </div>
           </div>

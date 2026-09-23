@@ -6,7 +6,10 @@ export default defineConfig({
     name: "VibexCorp LinkedIn Outreach",
     description: "Extensão Thin Client para captura contextual e acompanhamento de cadência no LinkedIn.",
     version: "1.0.0",
-    permissions: ["storage", "activeTab", "tabs", "scripting", "cookies"],
+    // "alarms" é OBRIGATÓRIO: o background usa chrome.alarms como keepalive
+    // MV3 (service worker dorme ~30s parado). Sem ela, o polling pára
+    // silenciosamente e a automação "não acontece nada na tela".
+    permissions: ["storage", "activeTab", "tabs", "scripting", "cookies", "alarms"],
     host_permissions: [
       "*://*.linkedin.com/*",
       "http://localhost:8080/*",

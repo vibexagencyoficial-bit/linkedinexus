@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -40,6 +41,7 @@ type Server struct {
 	renderer      *templates.Renderer
 	provider      messaging.MessagingProvider
 	rateLimiter   *ratelimit.RateLimiter
+	redisClient   *redisplatform.Client
 	extensionZip  string // caminho do zip servido em /downloads/extension.zip
 	assist        *AssistService
 	workerStop    chan struct{}
@@ -77,11 +79,14 @@ func NewServerWithRedis(
 		renderer:      templates.NewRenderer(),
 		provider:      messaging.NewLinkedInProvider("https://api.linkedin.com"),
 		rateLimiter:   rl,
+		redisClient:   redisClient,
 		extensionZip:  extensionZipPath,
 		assist:        NewAssistServiceFromEnv(),
 		workerStop:    make(chan struct{}),
 	}
 	srv.startOutreachWorker()
+	// Sessões DB-backed: JWT com sid só autentica com sessão viva no banco.
+	srv.authService.SetSessionValidator(srv.sessionValidatorMW)
 	return srv
 }
 
@@ -177,14 +182,32 @@ func (s *Server) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := s.authService.GenerateToken(userID, orgID, email, role)
+	// Credenciais TEMPORÁRIAS DB-backed: access JWT 15min (amarrado a sessão
+	// revogável) + refresh token 7d rotacionado no banco. Nada de 72h eterno.
+	accessSession := uuid.New()
+	token, err := s.authService.GenerateTokenWithTTL(userID, orgID, email, role, panelAccessTTL, accessSession.String())
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "AUTH_TOKEN_GENERATION_FAILED", "failed to generate session token", nil)
 		return
 	}
+	if err := insertAuthSession(r.Context(), s, orgID, userID, nil, accessSession, "panel", hashToken(token), panelAccessTTL); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "AUTH_TOKEN_GENERATION_FAILED", "failed to persist session", nil)
+		return
+	}
+	refreshToken, err := randomToken()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "AUTH_TOKEN_GENERATION_FAILED", "failed to generate refresh token", nil)
+		return
+	}
+	if err := insertAuthSession(r.Context(), s, orgID, userID, nil, uuid.New(), "refresh", hashToken(refreshToken), refreshTTL); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "AUTH_TOKEN_GENERATION_FAILED", "failed to persist refresh session", nil)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"token": token,
+		"token":         token,
+		"refresh_token": refreshToken,
+		"expires_in":    int(panelAccessTTL.Seconds()),
 		"user": map[string]any{
 			"id":              userID,
 			"organization_id": orgID,
@@ -196,6 +219,10 @@ func (s *Server) HandleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	// Best-effort: revoga a sessão do JWT atual (sid) e as do usuário.
+	if claims, ok := auth.GetClaims(r.Context()); ok {
+		_ = s.revokeSessionsByUser(r.Context(), claims.OrganizationID, claims.UserID)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
 }
 
@@ -206,31 +233,31 @@ func (s *Server) HandleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Nome REAL do usuário autenticado (nunca nome fictício hardcoded).
+	name := claims.Email
+	if !s.withTenantDB(w, r, claims.OrganizationID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(r.Context(), `
+			SELECT name FROM users WHERE id = $1
+		`, claims.UserID).Scan(&name); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil // cai no email como nome
+			}
+			return err
+		}
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user": map[string]any{
 			"id":              claims.UserID,
 			"organization_id": claims.OrganizationID,
 			"email":           claims.Email,
-			"name":            "Lucas (VibexCorp)",
+			"name":            name,
 			"role":            claims.Role,
 		},
 	})
-}
-
-func (s *Server) HandleRefresh(w http.ResponseWriter, r *http.Request) {
-	claims, ok := auth.GetClaims(r.Context())
-	if !ok {
-		writeAPIError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "session required", nil)
-		return
-	}
-
-	newToken, err := s.authService.GenerateToken(claims.UserID, claims.OrganizationID, claims.Email, claims.Role)
-	if err != nil {
-		writeAPIError(w, http.StatusInternalServerError, "AUTH_TOKEN_REFRESH_FAILED", "failed to refresh token", nil)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"token": newToken})
 }
 
 // --- B2: tenant context helper (PRD-honestidade-conexao, Fase B2) ---//
@@ -351,8 +378,29 @@ func (s *Server) HandleCurrentAccount(w http.ResponseWriter, r *http.Request) {
 		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
+	// VERDADE ÚNICA: "connected" exige a flag no banco E um device da extensão
+	// realmente pareado com heartbeat recente (≤2min). A flag sozinha nunca
+	// mais mantém o painel "CONECTADA" com a extensão fora do ar.
+	liveDevice := false
+	if found {
+		_ = s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+			var recent int
+			if err := tx.QueryRow(r.Context(), `
+				SELECT COUNT(*) FROM extension_devices
+				WHERE organization_id = $1 AND status = 'active'
+				  AND last_seen_at > NOW() - INTERVAL '2 minutes'
+			`, orgID).Scan(&recent); err != nil {
+				return err
+			}
+			liveDevice = recent > 0
+			return nil
+		})
+	}
+	connected := found && status == "connected" && liveDevice
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"connected":             found && status == "connected",
+		"connected":             connected,
+		"live_device":           liveDevice,
 		"id":                    id,
 		"display_name":          name,
 		"connection_status":     status,
@@ -383,8 +431,15 @@ func (s *Server) HandleConnectAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.DisplayName == "" {
-		req.DisplayName = "Lucas (LinkedIn Profile)"
+	// Sem nome fictício: quando o frontend não manda display_name, usamos o
+	// nome REAL do usuário autenticado (identidade vem do cadastro/sessão).
+	if req.DisplayName == "" || req.DisplayName == "Lucas (LinkedIn Profile)" {
+		var userName string
+		if err := s.pgClient.ExecWithTenant(r.Context(), orgID, func(tx pgx.Tx) error {
+			return tx.QueryRow(r.Context(), `SELECT name FROM users WHERE id = $1`, userID).Scan(&userName)
+		}); err == nil && strings.TrimSpace(userName) != "" {
+			req.DisplayName = strings.TrimSpace(userName) + " (LinkedIn)"
+		}
 	}
 
 	accountID := uuid.New()
@@ -454,17 +509,33 @@ func (s *Server) HandleDisconnectAccount(w http.ResponseWriter, r *http.Request)
 	}
 
 	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(r.Context(), `
 			UPDATE linkedin_accounts
 			SET connection_status = 'disconnected', updated_at = NOW()
 			WHERE organization_id = $1
-		`, orgID)
-		return err
+		`, orgID); err != nil {
+			return err
+		}
+
+		// Desconectar também revoga os devices pareados: a extensão recebe
+		// 401 no heartbeat e faz unpair local (estado consistente dos dois
+		// lados, sem "CONECTADA" órfão).
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE extension_devices
+			SET status = 'inactive', revoked_at = NOW(), last_seen_at = last_seen_at
+			WHERE organization_id = $1 AND status = 'active'
+		`, orgID); err != nil {
+			return err
+		}
+		return nil
 	}) {
 		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
 	s.broker.Publish(orgID, "integration.updated", map[string]string{"status": "disconnected"})
+	// Revoga as sessões de extensão da org: o heartbeat/poll da extensão
+	// recebe 401 e faz unpair local (auto-recuperação dos dois lados).
+	_ = s.revokeExtensionSessions(r.Context(), orgID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "disconnected"})
 }
 
@@ -483,6 +554,17 @@ func (s *Server) HandleGeneratePairingCode(w http.ResponseWriter, r *http.Reques
 
 	// INSERT sujeito a RLS: exige o contexto do tenant dentro da transacao.
 	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		// Invalida códigos pendentes anteriores da org: só UM código vivo por
+		// vez (o painel exibia código expirado/consumido e o usuário colava
+		// código morto recebendo 404).
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE extension_devices
+			SET pairing_expires_at = NOW()
+			WHERE organization_id = $1 AND status = 'pairing' AND pairing_expires_at > NOW()
+		`, orgID); err != nil {
+			return err
+		}
+
 		_, err := tx.Exec(r.Context(), `
 			INSERT INTO extension_devices (
 				organization_id, user_id, device_name, pairing_code, pairing_expires_at, token_hash, status
@@ -558,11 +640,14 @@ func (s *Server) HandlePairExtension(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pareamento também emite token de device TEMPORÁRIO (30d): sem credencial
+	// eterna; a extensão re-vincula quando expira.
 	if _, err := tx.Exec(r.Context(), `
 		UPDATE extension_devices
-		SET device_name = $1, token_hash = $2, status = 'active', pairing_code = NULL, last_seen_at = NOW()
+		SET device_name = $1, token_hash = $2, status = 'active', pairing_code = NULL,
+		    last_seen_at = NOW(), token_expires_at = $4
 		WHERE id = $3
-	`, "VibexCorp Chrome Extension MV3", tokenHash, deviceID); err != nil {
+	`, "VibexCorp Chrome Extension MV3", tokenHash, deviceID, time.Now().Add(deviceTokenTTL)); err != nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to persist device pairing", nil)
 		return
 	}
@@ -578,22 +663,29 @@ func (s *Server) HandlePairExtension(w http.ResponseWriter, r *http.Request) {
 	// mesmo tenant/usuário do device pareado) para consumir /messaging/* e
 	// /assist/* — o extension_token continua sendo a credencial do heartbeat
 	// (resolve por token_hash na policy 000008).
-	apiJWT := ""
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_ = s.pgClient.ExecWithTenant(r.Context(), orgID, func(tx pgx.Tx) error {
-			var email, role string
-			if err := tx.QueryRow(r.Context(), `
-				SELECT email, role FROM users WHERE id = $1
-			`, dbUserID).Scan(&email, &role); err != nil {
-				return err
-			}
-			token, err := s.authService.GenerateToken(dbUserID, orgID, email, role)
-			if err != nil {
-				return err
-			}
-			apiJWT = token
-			return nil
-		})
+	//
+	// FALHA = 500 honesto (antes: `_ =` engolia o erro e a resposta 200
+	// carregava api_jwt vazio — badge CONECTADA com polling morto).
+	var email, role string
+	if err := s.pgClient.ExecWithTenant(r.Context(), orgID, func(tx pgx.Tx) error {
+		return tx.QueryRow(r.Context(), `
+			SELECT email, role FROM users WHERE id = $1
+		`, dbUserID).Scan(&email, &role)
+	}); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "PAIR_JWT_FAILED", "paired but failed to issue session token — tente parear novamente", nil)
+		return
+	}
+
+	// JWT curto (60min) amarrado a sessão DB-backed revogável.
+	sessionID := uuid.New()
+	apiJWT, err := s.authService.GenerateTokenWithTTL(dbUserID, orgID, email, role, extensionJWTTL, sessionID.String())
+	if err != nil || apiJWT == "" {
+		writeAPIError(w, http.StatusInternalServerError, "PAIR_JWT_FAILED", "paired but failed to sign session token — tente parear novamente", nil)
+		return
+	}
+	if err := insertAuthSession(r.Context(), s, orgID, dbUserID, &deviceID, sessionID, "extension", hashToken(apiJWT), extensionJWTTL); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "PAIR_JWT_FAILED", "paired but failed to persist session — tente parear novamente", nil)
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -644,9 +736,11 @@ func (s *Server) HandleExtensionHeartbeat(w http.ResponseWriter, r *http.Request
 		SELECT id, organization_id
 		FROM extension_devices
 		WHERE token_hash = $1 AND status = 'active'
+		  AND (token_expires_at IS NULL OR token_expires_at > NOW())
 		LIMIT 1
 	`, tokenHash).Scan(&deviceID, &orgID); err != nil {
-		writeAPIError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "unknown or inactive device", nil)
+		// Token expirado/revogado = 401: a extensão trata 401 como unpair.
+		writeAPIError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "unknown, inactive or expired device", nil)
 		return
 	}
 
@@ -731,6 +825,23 @@ func (s *Server) HandleExtensionStatus(w http.ResponseWriter, r *http.Request) {
 
 // --- Contacts Endpoints (Section 14, 15) ---
 
+// splitFullName decompõe "Full Name" em (first, last). "Bruno Costa" →
+// ("Bruno", "Costa"); "Silva, Marcos" (formato "Sobrenome, Nome" do export do
+// LinkedIn) → ("Marcos", "Silva"); nome único fica sem sobrenome.
+func splitFullName(full string) (string, string) {
+	if before, after, found := strings.Cut(full, ","); found {
+		return strings.TrimSpace(after), strings.TrimSpace(before)
+	}
+	parts := strings.Fields(full)
+	if len(parts) == 0 {
+		return "", ""
+	}
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], strings.Join(parts[1:], " ")
+}
+
 type ContactInput struct {
 	FirstName   string         `json:"first_name"`
 	LastName    string         `json:"last_name"`
@@ -754,6 +865,12 @@ func (s *Server) HandleCreateContact(w http.ResponseWriter, r *http.Request) {
 
 	if in.FullName == "" && in.FirstName != "" {
 		in.FullName = strings.TrimSpace(in.FirstName + " " + in.LastName)
+	}
+	// Listas reais frequentemente só trazem o nome completo (export do
+	// LinkedIn): sem first/last o pipeline não renderiza {{first_name}} e o
+	// worker para o contato com missing_variables. Decompõe na entrada.
+	if in.FirstName == "" && in.FullName != "" {
+		in.FirstName, in.LastName = splitFullName(in.FullName)
 	}
 	if in.LinkedInURL == "" {
 		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "linkedin_url is required", nil)
@@ -986,6 +1103,11 @@ func (s *Server) HandleImportContactsCSV(w http.ResponseWriter, r *http.Request)
 		if full == "" && fn != "" {
 			full = strings.TrimSpace(fn + " " + ln)
 		}
+		// Mesma decomposição do sync: "Full Name" sozinho precisa gerar
+		// first/last, senão a cadência para com missing_variables.
+		if fn == "" && full != "" {
+			fn, ln = splitFullName(full)
+		}
 		if url == "" {
 			skipped++
 			continue
@@ -1097,8 +1219,12 @@ func (s *Server) HandleSyncLinkedInContacts(w http.ResponseWriter, r *http.Reque
 		if full == "" && c.FirstName != "" {
 			full = strings.TrimSpace(c.FirstName + " " + c.LastName)
 		}
+		fn, ln := c.FirstName, c.LastName
+		if fn == "" && full != "" {
+			fn, ln = splitFullName(full)
+		}
 		metaJSON, _ := json.Marshal(c.Metadata)
-		rows = append(rows, syncRow{c.FirstName, c.LastName, full, c.Company, c.JobTitle, c.LinkedInURL, metaJSON})
+		rows = append(rows, syncRow{fn, ln, full, c.Company, c.JobTitle, c.LinkedInURL, metaJSON})
 	}
 
 	batch := make([][]any, 0, len(rows))
@@ -1106,20 +1232,34 @@ func (s *Server) HandleSyncLinkedInContacts(w http.ResponseWriter, r *http.Reque
 		batch = append(batch, []any{orgID, row.fn, row.ln, row.full, row.comp, row.job, row.url, row.meta})
 	}
 
-	// Sync inteiro numa única transação com tenant: COPY sob RLS + dedup
-	// pós-copy restrito à org (o filtro organization_id no USING é
-	// obrigatório — sem ele, linhas de outros tenants seriam apagadas).
+	// Sync inteiro numa única transação com tenant. INSERT em lote
+	// (pgx.Batch pipelined): COPY FROM não é suportado com RLS ativa
+	// (SQLSTATE 0A000) — mesmo motivo do import CSV.
 	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
-		if len(batch) == 0 {
-			return nil
-		}
-		if _, err := tx.CopyFrom(
-			r.Context(),
-			pgx.Identifier{"contacts"},
-			[]string{"organization_id", "first_name", "last_name", "full_name", "company", "job_title", "linkedin_url", "metadata"},
-			pgx.CopyFromRows(batch),
-		); err != nil {
-			return err
+		const chunk = 500
+		for start := 0; start < len(batch); start += chunk {
+			end := start + chunk
+			if end > len(batch) {
+				end = len(batch)
+			}
+			b := &pgx.Batch{}
+			for _, row := range batch[start:end] {
+				b.Queue(`
+					INSERT INTO contacts (organization_id, first_name, last_name, full_name, company, job_title, linkedin_url, metadata)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+					ON CONFLICT (organization_id, linkedin_url) DO UPDATE SET
+						first_name = EXCLUDED.first_name,
+						last_name = EXCLUDED.last_name,
+						full_name = EXCLUDED.full_name,
+						company = EXCLUDED.company,
+						job_title = EXCLUDED.job_title,
+						metadata = EXCLUDED.metadata,
+						updated_at = NOW()
+				`, row...)
+			}
+			if err := tx.SendBatch(r.Context(), b).Close(); err != nil {
+				return err
+			}
 		}
 		_, err := tx.Exec(r.Context(), `
 			DELETE FROM contacts a USING contacts b
@@ -1223,6 +1363,15 @@ func (s *Server) HandleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(in.Name) == "" {
 		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "campaign name is required", nil)
 		return
+	}
+
+	// Janela de envio é opcional no contrato: vazio vira NULL, nunca string
+	// vazia (que estoura o cast ::time com 22007).
+	if in.AllowedStartTime == "" {
+		in.AllowedStartTime = "00:00:00"
+	}
+	if in.AllowedEndTime == "" {
+		in.AllowedEndTime = "23:59:59"
 	}
 
 	campID := uuid.New()
@@ -1827,6 +1976,9 @@ func (s *Server) HandleDashboardMetrics(w http.ResponseWriter, r *http.Request) 
 	var (
 		activeCamps, contactsCount, contactedCount, replies int
 		isExtConnected, isLiConnected                        bool
+		extSeen                                              *time.Time
+		jevAvg                                               *float64
+		jevSamples                                            int
 	)
 
 	// Métricas agregadas no banco sob o tenant (RLS): zero linhas de outro
@@ -1845,7 +1997,7 @@ func (s *Server) HandleDashboardMetrics(w http.ResponseWriter, r *http.Request) 
 		`, orgID).Scan(&contactsCount, &contactedCount, &replies); err != nil {
 			return err
 		}
-		var extSeen, liStatus *time.Time
+		var liStatus *time.Time
 		if err := tx.QueryRow(r.Context(), `
 			SELECT MAX(last_seen_at) FROM extension_devices
 			WHERE organization_id = $1 AND status = 'active'
@@ -1860,6 +2012,23 @@ func (s *Server) HandleDashboardMetrics(w http.ResponseWriter, r *http.Request) 
 		}
 		isExtConnected = extSeen != nil && time.Since(*extSeen) < 2*time.Minute
 		isLiConnected = liStatus != nil
+		// Latência média do Jev (ms) nos disparos das últimas 24h: AVG/COUNT
+		// sobre o campo jev_ms do payload message.sent. COALESCE trata NULL
+		// (eventos antigos sem métrica): só conta quem tem valor > 0.
+		var avg sql.NullFloat64
+		if err := tx.QueryRow(r.Context(), `
+			SELECT AVG((payload->>'jev_ms')::bigint), COUNT(*)
+			FROM events
+			WHERE organization_id = $1 AND event_type = 'message.sent'
+			  AND created_at > NOW() - INTERVAL '24 hours'
+			  AND COALESCE((payload->>'jev_ms')::bigint, 0) > 0
+		`, orgID).Scan(&avg, &jevSamples); err != nil {
+			return err
+		}
+		if avg.Valid {
+			v := avg.Float64
+			jevAvg = &v
+		}
 		return nil
 	}) {
 		return // 503 STORE_UNAVAILABLE já respondido pelo helper
@@ -1874,7 +2043,10 @@ func (s *Server) HandleDashboardMetrics(w http.ResponseWriter, r *http.Request) 
 		"telemetry_processed": telemetry.GlobalMetrics.JobsProcessed.Load(),
 		"kill_switch_active":  s.safetyService.IsGlobalKillSwitchActive(orgID),
 		"extension_connected": isExtConnected,
+		"extension_last_seen": extSeen, // nulo = nunca sinalizou
 		"linkedin_connected":  isLiConnected,
+		"jev_avg_ms":          jevAvg, // nulo = sem amostras nas últimas 24h
+		"jev_samples":         jevSamples,
 	})
 }
 
@@ -2089,6 +2261,14 @@ func (s *Server) processNextOutreachStepForOrg(ctx context.Context, orgID uuid.U
 				return err
 			}
 
+			// Tempo real: o painel assina /events/stream e mostra a fila ao vivo.
+			s.broker.Publish(orgID, "message.queued", map[string]any{
+				"contact_name": cand.FullName,
+				"company":      cand.Company,
+				"campaign":     campName,
+				"job_id":       idemKey,
+			})
+
 			telemetry.GlobalMetrics.JobsProcessed.Add(1)
 			return nil // um despacho por org por tick
 		}
@@ -2147,7 +2327,14 @@ func (s *Server) currentMessageStep(ctx context.Context, tx pgx.Tx, orgID, campI
 		WHERE organization_id = $1 AND campaign_id = $2 AND position = $3
 	`, orgID, campID, cand.Position).Scan(&step.id, &stepType, &step.templateBody, &delayAmount, &delayUnit)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Sem passo nessa posição: cadência terminou para o contato.
+		if cand.Position <= 1 {
+			// Sem passo na posição inicial: a cadência está vazia (campanha
+			// criada sem fluxo — ex.: "Fluxo em Branco" ainda não montado no
+			// Flow Builder, ou criação via API). Completar aqui mentiria — o
+			// contato nunca recebeu nada; fica pendente até haver cadência.
+			return stepRef{}, false
+		}
+		// Já avançou pela cadência e não há mais passos: terminou de verdade.
 		_, _ = tx.Exec(ctx, `
 			UPDATE campaign_contacts
 			SET status = 'completed', completed_at = NOW(), updated_at = NOW()
@@ -2158,7 +2345,10 @@ func (s *Server) currentMessageStep(ctx context.Context, tx pgx.Tx, orgID, campI
 	if err != nil {
 		return stepRef{}, false
 	}
-	if stepType == "MESSAGE" {
+	// Comparação case-insensitive: o builder da UI grava "MESSAGE", mas o
+	// contrato da API aceita "message" — casar caixa fixa fazia o passo cair
+	// no ramo não-entregável e a cadência completava sem enfileirar nada.
+	if strings.EqualFold(stepType, "message") {
 		// Job já em fila para esse passo? Aí o contato está reservado — não
 		// pega de novo (evita duplicar despacho enquanto a extensão executa).
 		var exists bool
@@ -2397,6 +2587,13 @@ type ReportSentRequest struct {
 	Status        string `json:"status"`
 	JobID         string `json:"job_id"` // job enfileirado pelo worker (pipeline real)
 	Error         string `json:"error"`  // não vazio = falha na entrega → retry
+	// Auditoria do Jev + métricas de latência (a extensão envia; o painel exibe).
+	AssistSource      string  `json:"assist_source"`
+	AssistConfidence  float64 `json:"assist_confidence"`
+	AssistPageState   string  `json:"assist_page_state"`
+	JevMs             int64   `json:"jev_ms"`
+	AssistTotalMs     int64   `json:"assist_total_ms"`
+	AssistRoundtripMs int64   `json:"assist_roundtrip_ms"`
 }
 
 func (s *Server) HandleReportSentMessage(w http.ResponseWriter, r *http.Request) {
@@ -2516,10 +2713,16 @@ func (s *Server) HandleReportSentMessage(w http.ResponseWriter, r *http.Request)
 			return err
 		}
 		payload, _ := json.Marshal(map[string]any{
-			"contact_name": recipient,
-			"company":      company,
-			"message_body": req.MessageBody,
-			"sent_via":     "extension",
+			"contact_name":        recipient,
+			"company":             company,
+			"message_body":        req.MessageBody,
+			"sent_via":            "extension",
+			"assist_source":       req.AssistSource,
+			"assist_confidence":   req.AssistConfidence,
+			"assist_page_state":   req.AssistPageState,
+			"jev_ms":              req.JevMs,
+			"assist_total_ms":     req.AssistTotalMs,
+			"assist_roundtrip_ms": req.AssistRoundtripMs,
 		})
 		_, err = tx.Exec(r.Context(), `
 			INSERT INTO events (organization_id, entity_type, entity_id, event_type, payload)
@@ -2692,10 +2895,16 @@ func (s *Server) handleJobReportSent(w http.ResponseWriter, r *http.Request, org
 			return err
 		}
 		s.recordEventTx(tx, orgID, adv.convID, "message.sent", map[string]any{
-			"contact_name": adv.recipient,
-			"company":      adv.company,
-			"job_id":       req.JobID,
-			"sent_via":     "extension",
+			"contact_name":        adv.recipient,
+			"company":             adv.company,
+			"job_id":              req.JobID,
+			"sent_via":            "extension",
+			"assist_source":       req.AssistSource,
+			"assist_confidence":   req.AssistConfidence,
+			"assist_page_state":   req.AssistPageState,
+			"jev_ms":              req.JevMs,
+			"assist_total_ms":     req.AssistTotalMs,
+			"assist_roundtrip_ms": req.AssistRoundtripMs,
 		})
 
 		// 4. Avança a cadência: próximo passo com o delay do passo atual,

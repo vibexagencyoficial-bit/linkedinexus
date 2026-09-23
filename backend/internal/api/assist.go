@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
@@ -28,20 +29,42 @@ import (
 // timings) — nunca contém .env, tokens, cookies ou credenciais.
 
 const (
-	assistTimeout       = 8 * time.Second
-	assistMaxRetries    = 2
-	assistRatePerMin    = 10
-	assistCacheCap      = 256
-	assistCacheTTL      = 10 * time.Minute
-	assistConfidenceMin = 0.5
+	assistTimeout    = 8 * time.Second
+	assistMaxRetries = 2
+	assistCacheCap   = 256
+	assistCacheTTL   = 10 * time.Minute
+
+	// Defaults configuráveis via env (o Jev é o decisor: floor de confiança
+	// e limite de requisições não podem ficar engessados em hardcode).
+	defaultAssistRatePerMin    = 60
+	defaultAssistConfidenceMin = 0.5
 )
 
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 1 {
+			return f
+		}
+	}
+	return def
+}
+
 type AssistService struct {
-	apiURL string
-	apiKey string
-	model  string
-	floor  float64
-	client *http.Client
+	apiURL    string
+	apiKey    string
+	model     string
+	floor     float64
+	rateLimit int
+	client    *http.Client
 
 	cacheMu sync.Mutex
 	cache   map[string]assistCacheEntry
@@ -82,16 +105,34 @@ type HumanizeParams struct {
 	SuggestedSelector string  `json:"suggested_selector,omitempty"`
 	PageState         string  `json:"page_state,omitempty"`
 	Confidence        float64 `json:"confidence,omitempty"`
+	// PacingLevel é a DECISÃO do Jev (conservative/moderate/energetic) que
+	// gerou estes números — aparece no log e na auditoria do report-sent.
+	PacingLevel string `json:"pacing_level,omitempty"`
+	// Métricas de latência (medidor do algoritmo): quanto tempo o Jev levou
+	// para decidir. jev_ms = soma do HTTP puro à Typesafe (0 quando não houve
+	// chamada: cache/fallback/erro); assist_total_ms = handler completo
+	// (cache + Jev + fallback); cached = veio do cache (jev_ms=0 esperado).
+	JevMs         int64 `json:"jev_ms"`
+	AssistTotalMs int64 `json:"assist_total_ms"`
+	Cached        bool  `json:"cached,omitempty"`
+}
+
+// assistLog: logger JSON no stdout (vai para D:/vibex/logs/api.log via
+// redirect do start.ps1). NUNCA loga chave, token, cookie ou credencial —
+// só decisões estruturais (quem guiou, nível decidido, confiança, motivo).
+func assistLog() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, nil))
 }
 
 func NewAssistServiceFromEnv() *AssistService {
 	return &AssistService{
-		apiURL: os.Getenv("TYPESAFE_API_URL"),
-		apiKey: os.Getenv("TYPESAFE_API_KEY"),
-		model:  os.Getenv("TYPESAFE_MODEL"),
-		floor:  assistConfidenceMin,
-		client: &http.Client{Timeout: assistTimeout},
-		cache:  make(map[string]assistCacheEntry),
+		apiURL:    os.Getenv("TYPESAFE_API_URL"),
+		apiKey:    os.Getenv("TYPESAFE_API_KEY"),
+		model:     os.Getenv("TYPESAFE_MODEL"),
+		floor:     envFloat("JEV_CONFIDENCE_FLOOR", defaultAssistConfidenceMin),
+		rateLimit: envInt("ASSIST_RATE_PER_MIN", defaultAssistRatePerMin),
+		client:    &http.Client{Timeout: assistTimeout},
+		cache:     make(map[string]assistCacheEntry),
 	}
 }
 
@@ -130,6 +171,7 @@ func (s *Server) HandleAssistHumanize(w http.ResponseWriter, r *http.Request) {
 	if _, _, ok := tenantOr401(w, r); !ok {
 		return
 	}
+	handlerStart := time.Now()
 
 	var req HumanizeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -142,25 +184,55 @@ func (s *Server) HandleAssistHumanize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.assist == nil || s.assist.apiKey == "" || s.assist.apiURL == "" {
-		writeJSON(w, http.StatusOK, fallbackParams("assist_not_configured"))
+		p := fallbackParams("assist_not_configured")
+		p.AssistTotalMs = time.Since(handlerStart).Milliseconds()
+		assistLog().Warn("assist fallback: chave/URL Typesafe ausentes — configure TYPESAFE_API_URL/KEY",
+			"reason", "assist_not_configured", "jev_ms", p.JevMs, "assist_total_ms", p.AssistTotalMs)
+		writeJSON(w, http.StatusOK, p)
 		return
 	}
 	if !s.assist.allowRequest() {
-		writeJSON(w, http.StatusOK, fallbackParams("assist_rate_limited"))
+		p := fallbackParams("assist_rate_limited")
+		p.AssistTotalMs = time.Since(handlerStart).Milliseconds()
+		assistLog().Warn("assist fallback: teto de requisições por minuto atingido",
+			"reason", "assist_rate_limited", "limit", s.assist.rateLimit,
+			"jev_ms", p.JevMs, "assist_total_ms", p.AssistTotalMs)
+		writeJSON(w, http.StatusOK, p)
 		return
 	}
 
 	cacheKey := s.assist.cacheKey(req)
 	if params, ok := s.assist.cacheGet(cacheKey); ok {
+		params.Cached = true
+		params.AssistTotalMs = time.Since(handlerStart).Milliseconds()
+		assistLog().Info("assist cache: resposta do Jev reutilizada",
+			"source", "typesafe", "cached", true,
+			"pacing_level", params.PacingLevel, "confidence", params.Confidence,
+			"jev_ms", params.JevMs, "assist_total_ms", params.AssistTotalMs)
 		writeJSON(w, http.StatusOK, params)
 		return
 	}
 
 	params, ok := s.assist.askTypesafe(r.Context(), req)
 	if !ok {
-		params = fallbackParams("assist_unavailable")
+		// Preserva a métrica quando o Jev FOI consultado (ex.: confiança
+		// abaixo do piso): askTypesafe devolve o fallback com JevMs
+		// preenchido. Só fabrica um fallback "assist_unavailable" zerado
+		// quando nada voltou (rede/transitório sem resposta).
+		if params.JevMs == 0 && params.PageState == "" {
+			params = fallbackParams("assist_unavailable")
+		}
+		if params.Source == "" {
+			params.Source = "fallback"
+		}
 	}
-	s.assist.cacheSet(cacheKey, params)
+	params.AssistTotalMs = time.Since(handlerStart).Milliseconds()
+	// Cache SOMENTE de resposta do Jev: cachear fallback congelaria o modo
+	// degradado por 10min (a automação rodaria cega exatamente quando o
+	// assist voltasse).
+	if params.Source == "typesafe" {
+		s.assist.cacheSet(cacheKey, params)
+	}
 	writeJSON(w, http.StatusOK, params)
 }
 
@@ -172,7 +244,7 @@ func (a *AssistService) allowRequest() bool {
 		a.rateWin = now
 		a.rateSeen = 0
 	}
-	if a.rateSeen >= assistRatePerMin {
+	if a.rateSeen >= a.rateLimit {
 		return false
 	}
 	a.rateSeen++
@@ -208,9 +280,9 @@ func (a *AssistService) cacheSet(key string, params HumanizeParams) {
 
 // typesafePayload monta o corpo {state, model, questions} no formato oficial.
 type typesafeQuestion struct {
-	Type         string   `json:"type"`
-	Instructions string   `json:"instructions,omitempty"`
-	Criteria     []string `json:"criteria,omitempty"`
+	Type         string         `json:"type"`
+	Instructions string         `json:"instructions,omitempty"`
+	Criteria     map[string]any `json:"criteria,omitempty"`
 }
 
 func (a *AssistService) askTypesafe(ctx context.Context, req HumanizeRequest) (HumanizeParams, bool) {
@@ -223,16 +295,35 @@ func (a *AssistService) askTypesafe(ctx context.Context, req HumanizeRequest) (H
 		"goal":       "automacao de outreach com comportamento humano no LinkedIn",
 	}
 
+	// Contrato REAL validado contra o openapi.json de api.typesafe.ai
+	// (GET /openapi.json, 23/09/2026): questions >= 1 (minProperties), e o
+	// criteria de choice é OBJETO {nome: descricao} — lista era rejeitada
+	// com 422. ChoiceAnswer exige choice+confidence+probabilities+type.
 	questions := map[string]typesafeQuestion{
 		"page_state": {
 			Type:         "choice",
 			Instructions: "Classifique o estado atual da página do LinkedIn a partir dos seletores disponíveis.",
-			Criteria:     []string{"message_box_open", "profile_page", "conversation_open", "error_or_blocked", "unknown"},
+			Criteria: map[string]any{
+				"message_box_open":  "Caixa de mensagem aberta",
+				"profile_page":      "Página de perfil",
+				"conversation_open": "Conversa aberta",
+				"error_or_blocked":  "Erro ou bloqueio do LinkedIn",
+				"unknown":           "Estado desconhecido",
+			},
 		},
 		"selector": {
 			Type:         "choice",
 			Instructions: "Qual seletor CSS é o alvo correto da ação agora? Responda exatamente um dos seletores listados.",
 			Criteria:     normalizeSelectors(req.Selectors),
+		},
+		"pacing_level": {
+			Type:         "choice",
+			Instructions: "Defina o nível de ritmo humano desta execução de outreach (decisão do Jev, aplicada à digitação e cliques).",
+			Criteria: map[string]any{
+				"conservative": "Ritmo lento e pausado, o mais humano",
+				"moderate":     "Ritmo equilibrado",
+				"energetic":    "Ritmo mais ritmado",
+			},
 		},
 		"pacing": {
 			Type:         "noul",
@@ -247,6 +338,7 @@ func (a *AssistService) askTypesafe(ctx context.Context, req HumanizeRequest) (H
 	})
 
 	var lastErr error
+	var jevMs int64 // soma do HTTP puro à Typesafe (todos os attempts)
 	for attempt := 0; attempt <= assistMaxRetries; attempt++ {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.apiURL, bytes.NewReader(body))
 		if err != nil {
@@ -255,7 +347,9 @@ func (a *AssistService) askTypesafe(ctx context.Context, req HumanizeRequest) (H
 		httpReq.Header.Set("Authorization", "Bearer "+a.apiKey)
 		httpReq.Header.Set("Content-Type", "application/json")
 
+		callStart := time.Now()
 		resp, err := a.client.Do(httpReq)
+		jevMs += time.Since(callStart).Milliseconds()
 		if err != nil {
 			lastErr = err
 			break // rede: sem retry infinito, cai no fallback
@@ -310,6 +404,25 @@ func (a *AssistService) askTypesafe(ctx context.Context, req HumanizeRequest) (H
 			params.SuggestedSelector = ans.Choice
 			conf = minFloat(conf, ans.Confidence)
 		}
+
+	// DECISÃO DO JEV: o pacing_level escolhido define o perfil numérico
+	// da execução. A confiança usada é a DA DECISÃO (pacing_level) — não o
+	// mínimo entre todas as respostas: page_state/selector com confiança
+	// baixa não podem vetar uma decisão de ritmo que o Jev tomou com
+	// confiança própria. O piso aplica-se ao pacing_level.
+	pacing := ""
+	pacingConf := 1.0
+	if ans, ok := parsed.Answers["pacing_level"]; ok && ans.Choice != "" {
+		pacing = strings.ToLower(ans.Choice)
+		pacingConf = ans.Confidence
+	} else {
+		assistLog().Warn("assist fallback: Jev não decidiu o pacing_level",
+			"source", "typesafe", "reason", "pacing_level_missing")
+		return fallbackParams("assist_no_pacing_decision"), false
+	}
+	params.PacingLevel = pacing
+	applyPacingProfile(&params, pacing)
+
 		if ans, ok := parsed.Answers["pacing"]; ok {
 			conf = minFloat(conf, ans.Confidence)
 			if ans.Noul >= 0.5 {
@@ -320,16 +433,40 @@ func (a *AssistService) askTypesafe(ctx context.Context, req HumanizeRequest) (H
 				params.PauseMsMax = params.PauseMsMax*3/2 + 200
 			}
 		}
-		params.Confidence = conf
-		if conf < a.floor {
-			// Confiança abaixo do piso (mesma regra do AGENTS.md p/ o Jev):
-			// não agir sobre a resposta — fallback honesto.
-			return fallbackParams("assist_low_confidence"), false
-		}
-		return params, true
+	params.Confidence = conf
+	params.JevMs = jevMs
+	if pacingConf < a.floor {
+		// Confiança abaixo do piso (mesma regra do AGENTS.md p/ o Jev):
+		// não agir sobre a resposta — fallback honesto.
+		assistLog().Warn("assist fallback: confiança do Jev abaixo do piso",
+			"source", "typesafe", "pacing_level", pacing,
+			"confidence", pacingConf, "floor", a.floor, "jev_ms", jevMs)
+		fb := fallbackParams("assist_low_confidence")
+		fb.JevMs = jevMs // o Jev FOI consultado (gastou ms), só não decidiu
+		return fb, false
 	}
+	assistLog().Info("assist Jev: pacing decidido para a execução",
+		"source", "typesafe", "pacing_level", pacing,
+		"page_state", params.PageState, "confidence", pacingConf,
+		"click_delay_ms", params.ClickDelayMs, "jev_ms", jevMs)
+	return params, true
+	}
+	// askTypesafe caiu no esgotamento das tentativas (rede/transitório):
+	// fallback zerado com o motivo registrado no log — visível em api.log.
+	// JevMs acumulado entra no fallback para auditoria (tentativas gastaram ms).
+	assistLog().Warn("assist fallback: Typesafe indisponível após tentativas",
+		"reason", "assist_unavailable", "last_error", errString(lastErr), "jev_ms", jevMs)
 	_ = lastErr
-	return HumanizeParams{}, false
+	fb := fallbackParams("assist_unavailable")
+	fb.JevMs = jevMs
+	return fb, false
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 type httpError string
@@ -338,19 +475,19 @@ func (e httpError) Error() string { return string(e) }
 
 func errHTTP(msg string) error { return httpError(msg) }
 
-func normalizeSelectors(selectors []string) []string {
-	out := make([]string, 0, len(selectors))
+// normalizeSelectors devolve criteria de choice no formato do spec
+// ({seletor: descricao}) — no máximo 6 alvos para a decisão do Jev.
+func normalizeSelectors(selectors []string) map[string]any {
+	out := map[string]any{}
 	for _, sel := range selectors {
 		sel = strings.TrimSpace(sel)
-		if sel != "" {
-			out = append(out, sel)
+		if sel == "" || len(out) >= 6 {
+			continue
 		}
-		if len(out) >= 6 {
-			break
-		}
+		out[sel] = "Seletor candidato ao alvo da ação"
 	}
 	if len(out) == 0 {
-		out = append(out, "none")
+		out["none"] = "Nenhum seletor disponível"
 	}
 	return out
 }
@@ -360,4 +497,37 @@ func minFloat(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// pacingProfiles: perfis numéricos decididos pelo Jev (pacing_level).
+// conservative = mais lento/pausado; energetic = mais ritmado. Todos os
+// valores recebem jitter humano em applyPacingProfile.
+var pacingProfiles = map[string]struct {
+	clickDelay [2]int
+	cps        [2]float64
+	pauseEvery [2]int
+	pauseMs    [2]int
+}{
+	"conservative": {clickDelay: [2]int{1400, 2600}, cps: [2]float64{3.5, 6.0}, pauseEvery: [2]int{12, 26}, pauseMs: [2]int{700, 1800}},
+	"moderate":     {clickDelay: [2]int{900, 1800}, cps: [2]float64{5.0, 8.5}, pauseEvery: [2]int{18, 36}, pauseMs: [2]int{450, 1200}},
+	"energetic":    {clickDelay: [2]int{600, 1300}, cps: [2]float64{7.0, 11.0}, pauseEvery: [2]int{25, 48}, pauseMs: [2]int{300, 900}},
+}
+
+// applyPacingProfile aplica o perfil decidido pelo Jev com jitter; sem
+// decisão válida, mantém o perfil moderado (curva humana padrão).
+func applyPacingProfile(params *HumanizeParams, level string) {
+	prof, ok := pacingProfiles[level]
+	if !ok {
+		prof = pacingProfiles["moderate"]
+	}
+	params.ClickDelayMs = randInt(prof.clickDelay[0], prof.clickDelay[1])
+	params.TypeCpsMin = prof.cps[0] + rand.Float64()*0.5
+	params.TypeCpsMax = prof.cps[1] + rand.Float64()*0.5
+	params.PauseEveryMin = randInt(prof.pauseEvery[0], prof.pauseEvery[0]+6)
+	params.PauseEveryMax = randInt(prof.pauseEvery[1], prof.pauseEvery[1]+10)
+	params.PauseMsMin = randInt(prof.pauseMs[0], prof.pauseMs[0]+150)
+	params.PauseMsMax = randInt(prof.pauseMs[1], prof.pauseMs[1]+300)
+	params.ScrollDwellMs = randInt(500, 1300)
+	params.MouseStepsMin = randInt(14, 22)
+	params.MouseStepsMax = randInt(30, 44)
 }

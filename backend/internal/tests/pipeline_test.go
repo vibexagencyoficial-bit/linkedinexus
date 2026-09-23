@@ -446,3 +446,42 @@ func TestPendingOutreach_FilaVazia_200Honesto(t *testing.T) {
 		t.Fatalf("esperado job=null, obtido %v", out["job"])
 	}
 }
+
+// Regressão: cadência VAZIA (campanha criada sem fluxo — "Fluxo em Branco" ou
+// via API) não pode completar contatos. Antes da correção, o worker via
+// ErrNoRows na posição 1 e marcava 'completed' — contato encerrado sem nunca
+// ter recebido nada, silenciosamente.
+func TestPipeline_CadenciaVazia_NaoCompletaContatos(t *testing.T) {
+	c := liveClient(t)
+	srv, authSvc := liveServer(c)
+	orgID := freshTenantOrg(t, c, "pipe-vazia", "Pipeline Cadencia Vazia")
+	_, baseReq := liveToken(t, c, authSvc, orgID)
+	seedWorkerUserAndDevice(t, c, orgID)
+
+	c1 := seedTenantContact(t, c, orgID, "Sem Steps", "https://linkedin.com/in/pipe-sem-steps")
+	campID := createCampaignViaHandler(t, srv, baseReq, []uuid.UUID{c1})
+	// SEM seedCampaignSteps: cadência propositalmente vazia.
+
+	startReq := withChiID(t, httptest.NewRequest("POST", "/api/v1/campaigns/x/start", nil).WithContext(baseReq.Context()), campID.String())
+	startRec := httptest.NewRecorder()
+	srv.HandleStartCampaign(startRec, startReq)
+	if startRec.Code != 200 {
+		t.Fatalf("start: esperado 200, obtido %d (%s)", startRec.Code, startRec.Body.String())
+	}
+
+	srv.ProcessOutreachStepForOrg(context.Background(), orgID)
+
+	if n := countCampaignContactsByStatus(t, c, orgID, "completed"); n != 0 {
+		t.Fatalf("cadencia vazia completou %d contato(s) sem enviar nada — devia ficar pendente", n)
+	}
+	if n := countCampaignContactsByStatus(t, c, orgID, "pending"); n != 1 {
+		t.Fatalf("contato devia permanecer 'pending' ate haver cadencia; pending=%d", n)
+	}
+
+	// E depois de a cadência existir, o tick seguinte enfileira normalmente.
+	seedCampaignSteps(t, c, orgID, campID)
+	srv.ProcessOutreachStepForOrg(context.Background(), orgID)
+	if n := countQueuedJobs(t, c, orgID); n != 1 {
+		t.Fatalf("apos adicionar steps o worker devia enfileirar 1 job; ha %d", n)
+	}
+}
