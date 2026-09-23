@@ -1,11 +1,11 @@
 import { defineContentScript } from "wxt/sandbox";
 
+// Content script: SOMENTE automação no DOM do LinkedIn. Nenhuma chamada de API
+// daqui (MV3 bloqueia cross-origin fetch de content script; o api_jwt fica no
+// background). O background navega até o perfil e manda EXECUTE_OUTREACH_JOB.
 export default defineContentScript({
   matches: ["*://*.linkedin.com/*"],
   main() {
-    let isDispatching = false;
-    let abortDispatch = false;
-
     // --- Profile Extractor ---
     function extractProfileData() {
       if (!window.location.hostname.includes("linkedin.com") || !window.location.pathname.startsWith("/in/")) {
@@ -64,16 +64,13 @@ export default defineContentScript({
       for (const sel of cardSelectors) {
         const cards = document.querySelectorAll(sel);
         cards.forEach((card) => {
-          // Link selector
           const linkEl = card.querySelector('a[href*="/in/"], a[href*="/messaging/thread/"]') as HTMLAnchorElement;
           let href = linkEl?.href ? linkEl.href.split("?")[0] : "";
           if (!href) return;
 
-          // Normalize thread link to profile if available
           if (seen.has(href)) return;
           seen.add(href);
 
-          // Name selectors with multiple fallbacks
           const nameEl = card.querySelector(
             ".mn-connection-card__name, .entity-result__title-text, .artdeco-entity-lockup__title, .msg-conversation-listitem__participant-names, span[aria-hidden='true']"
           );
@@ -81,7 +78,6 @@ export default defineContentScript({
           fullName = fullName.split("\n")[0].trim();
           if (!fullName || fullName.length < 2) return;
 
-          // Occupation / Headline selector
           const occEl = card.querySelector(
             ".mn-connection-card__occupation, .entity-result__primary-subtitle, .artdeco-entity-lockup__subtitle, .msg-conversation-card__message-snippet-body"
           );
@@ -125,7 +121,6 @@ export default defineContentScript({
                                 window.location.pathname.includes("/connections");
 
       if (!isConnectionsPage && !window.location.pathname.includes("/messaging")) {
-        // Just extract what's on the page
         return parseConnectionsFromDOM();
       }
 
@@ -145,7 +140,6 @@ export default defineContentScript({
           break;
         }
 
-        // Scroll down smoothly
         window.scrollTo({
           top: document.body.scrollHeight,
           behavior: "smooth"
@@ -166,70 +160,175 @@ export default defineContentScript({
       return all;
     }
 
-    // --- Dispatch Outreach Messages Directly Through Extension ---
-    async function dispatchMessages(
-      token: string,
-      contacts: any[],
-      onProgress: (status: { current: number; total: number; contactName: string; paused: boolean }) => void
-    ) {
-      if (isDispatching) return;
-      isDispatching = true;
-      abortDispatch = false;
+    // ================= Automação humana (pipeline real) =================
 
-      for (let i = 0; i < contacts.length; i++) {
-        if (abortDispatch) {
-          onProgress({ current: i, total: contacts.length, contactName: "Disparos pausados pelo operador", paused: true });
-          break;
-        }
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-        const contact = contacts[i];
-        const contactName = contact.full_name || contact.first_name || "Conexão";
-        const messageBody = contact.rendered_message || `Olá ${contact.first_name}, vamos conectar!`;
+    function randInt(min: number, max: number) {
+      return Math.floor(min + Math.random() * (max - min + 1));
+    }
 
-        onProgress({
-          current: i + 1,
-          total: contacts.length,
-          contactName: contactName,
-          paused: false
-        });
+    interface Humanize {
+      click_delay_ms?: number;
+      type_cps_min?: number;
+      type_cps_max?: number;
+      pause_every_min_chars?: number;
+      pause_every_max_chars?: number;
+      pause_ms_min?: number;
+      pause_ms_max?: number;
+      scroll_dwell_ms?: number;
+      suggested_selector?: string;
+    }
 
-        // 1. Report to SaaS backend in real time
+    function visible(el: Element): boolean {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }
+
+    // Botão "Message"/"Mensagem" do perfil — multi-seletores + fallback por
+    // aria-label (LinkedIn muda classes com frequência; o atributo é estável).
+    function findMessageButton(suggested?: string): HTMLButtonElement | null {
+      const candidates: HTMLButtonElement[] = [];
+
+      if (suggested) {
         try {
-          await fetch("http://localhost:8080/api/v1/messaging/report-sent", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${token}`
-            },
-            body: JSON.stringify({
-              contact_id: String(contact.id),
-              recipient_name: contactName,
-              message_body: messageBody,
-              linkedin_url: contact.linkedin_url,
-              status: "sent"
-            })
+          document.querySelectorAll(suggested).forEach((el) => {
+            if (el instanceof HTMLButtonElement && visible(el)) candidates.push(el);
           });
-        } catch (e) {
-          console.warn("[VibexCorp] Erro ao reportar mensagem enviada:", e);
-        }
-
-        // 2. Humanized platform safety delay (4.5s countdown between messages)
-        if (i < contacts.length - 1) {
-          for (let s = 4; s > 0; s--) {
-            if (abortDispatch) break;
-            await new Promise((r) => setTimeout(r, 1000));
-          }
+        } catch {
+          // seletor sugerido inválido — segue para os canônicos
         }
       }
 
-      isDispatching = false;
+      const selectorList = [
+        "button[aria-label*='Message']",
+        "button[aria-label*='mensagem']",
+        "button[aria-label*='Mensagem']",
+        ".pv-s-profile-actions button",
+        ".pvs-profile-actions__action",
+      ];
+      for (const sel of selectorList) {
+        document.querySelectorAll(sel).forEach((el) => {
+          if (el instanceof HTMLButtonElement && visible(el)) candidates.push(el);
+        });
+      }
+
+      for (const btn of candidates) {
+        const label = `${btn.getAttribute("aria-label") ?? ""} ${btn.innerText ?? ""}`.toLowerCase();
+        if (/message|mensagem/.test(label) && !btn.disabled) return btn;
+      }
+      return null;
+    }
+
+    function findComposer(): HTMLElement | null {
+      const list = document.querySelectorAll<HTMLElement>(
+        ".msg-form__contenteditable, div[contenteditable='true'][role='textbox']"
+      );
+      for (const el of list) {
+        if (visible(el)) return el;
+      }
+      return null;
+    }
+
+    function findSendButton(): HTMLButtonElement | null {
+      const list = document.querySelectorAll<HTMLButtonElement>(
+        ".msg-form__send-button, form.msg-form button[type='submit']"
+      );
+      for (const btn of list) {
+        const label = `${btn.getAttribute("aria-label") ?? ""} ${btn.innerText ?? ""}`.toLowerCase();
+        if (/send|enviar/.test(label) && !btn.disabled && visible(btn)) return btn;
+      }
+      return null;
+    }
+
+    async function waitFor<T>(
+      fn: () => T | null,
+      timeoutMs: number,
+      stepMs: number
+    ): Promise<T | null> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const found = fn();
+        if (found) return found;
+        await sleep(stepMs);
+      }
+      return fn();
+    }
+
+    // Digitação humana: caractere a caractere com cadência variável e pausas
+    // longas ocasionais (parâmetros vindos do assist Jev via background).
+    // insertText dispara os eventos input que o editor do LinkedIn espera;
+    // colagem instantânea seria detectável e não dispara os eventos do form.
+    async function typeHumanly(composer: HTMLElement, text: string, humanize: Humanize) {
+      composer.focus();
+      const cpsMin = humanize.type_cps_min ?? 7;
+      const cpsMax = humanize.type_cps_max ?? 12;
+      const pauseEveryMin = humanize.pause_every_min_chars ?? 25;
+      const pauseEveryMax = humanize.pause_every_max_chars ?? 45;
+      const pauseMsMin = humanize.pause_ms_min ?? 400;
+      const pauseMsMax = humanize.pause_ms_max ?? 1200;
+
+      let nextPauseAt = randInt(pauseEveryMin, pauseEveryMax);
+      for (let i = 0; i < text.length; i++) {
+        document.execCommand("insertText", false, text[i]);
+
+        if (i >= nextPauseAt) {
+          await sleep(randInt(pauseMsMin, pauseMsMax));
+          nextPauseAt = i + randInt(pauseEveryMin, pauseEveryMax);
+        } else {
+          const cps = cpsMin + Math.random() * (cpsMax - cpsMin);
+          await sleep(1000 / cps + Math.random() * 60);
+        }
+      }
+    }
+
+    async function executeOutreachJob(
+      job: { rendered_message: string },
+      humanize: Humanize
+    ): Promise<{ ok: boolean; error?: string; message_body?: string }> {
+      if (!window.location.pathname.startsWith("/in/")) {
+        return { ok: false, error: "NOT_ON_PROFILE" };
+      }
+
+      // 1. Botão Message (1º grau) — LinkedIn carrega as ações com atraso.
+      const btn = await waitFor(() => findMessageButton(humanize.suggested_selector), 15_000, 500);
+      if (!btn) return { ok: false, error: "MESSAGE_BUTTON_NOT_FOUND" };
+
+      btn.scrollIntoView({ block: "center", behavior: "smooth" });
+      await sleep(humanize.scroll_dwell_ms ?? 800);
+      btn.click();
+      await sleep((humanize.click_delay_ms ?? 1000) + randInt(200, 600));
+
+      // 2. Composer do messaging.
+      const composer = await waitFor(findComposer, 10_000, 300);
+      if (!composer) {
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        return { ok: false, error: "COMPOSER_NOT_FOUND" };
+      }
+
+      // 3. Digitação humana.
+      await typeHumanly(composer, job.rendered_message, humanize);
+      await sleep(randInt(500, 1200)); // revisão humana antes de enviar
+
+      // 4. Enviar.
+      const sendBtn = await waitFor(findSendButton, 8_000, 300);
+      if (!sendBtn) return { ok: false, error: "SEND_BUTTON_NOT_FOUND" };
+      sendBtn.click();
+
+      // 5. Verificação best-effort: composer fecha/limpa após o envio.
+      await sleep(1500);
+      if (findComposer()) {
+        // A confirmação visual não apareceu, mas o botão foi clicado — o
+        // report-sent do backend é quem confirma a entrega do job.
+        console.warn("[VibexCorp] composer ainda visível após clique em enviar");
+      }
+      return { ok: true, message_body: job.rendered_message };
     }
 
     // --- Message Listeners from Popup / Background ---
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (message.action === "GET_PROFILE_CONTEXT") {
-        const data = extractProfileData();
-        sendResponse({ profile: data });
+        sendResponse({ profile: extractProfileData() });
         return true;
       }
 
@@ -240,20 +339,11 @@ export default defineContentScript({
         return true;
       }
 
-      if (message.action === "START_OUTREACH_DISPATCH") {
-        dispatchMessages(message.token, message.contacts, (status) => {
-          chrome.runtime.sendMessage({ action: "DISPATCH_PROGRESS_UPDATE", ...status }).catch(() => {});
-        }).then(() => {
-          sendResponse({ completed: true });
+      if (message.action === "EXECUTE_OUTREACH_JOB") {
+        executeOutreachJob(message.job ?? {}, message.humanize ?? {}).then((result) => {
+          sendResponse(result);
         });
-        return true;
-      }
-
-      if (message.action === "PAUSE_OUTREACH_DISPATCH") {
-        abortDispatch = true;
-        isDispatching = false;
-        sendResponse({ paused: true });
-        return true;
+        return true; // resposta assíncrona
       }
     });
 
@@ -274,47 +364,38 @@ export default defineContentScript({
             📥 Extrair Conexões
           </button>
           <button id="vbx-open-saas" style="background: #6366f1; border: none; color: #fff; border-radius: 14px; padding: 4px 10px; font-size: 11px; cursor: pointer; font-weight: 600;">
-            ⚡ Abrir SaaS
+            ⚡ Abrir Painel
           </button>
         </div>
       `;
 
       document.body.appendChild(bar);
 
+      // Sync vai pelo background: content script não faz fetch cross-origin
+      // no MV3 (e o api_jwt não pode vazar para a página).
       document.getElementById("vbx-quick-sync")?.addEventListener("click", async () => {
         const btn = document.getElementById("vbx-quick-sync") as HTMLButtonElement;
         if (btn) btn.innerText = "⏳ Extraindo...";
-        const conns = await extractAllConnectionsWithAutoScroll(60);
 
-        // Fetch token from storage
-        chrome.storage?.local?.get(["auth_token"], async (res) => {
-          const tok = res?.auth_token;
-          if (tok) {
-            try {
-              const apiRes = await fetch("http://localhost:8080/api/v1/contacts/sync-linkedin", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Authorization": `Bearer ${tok}`
-                },
-                body: JSON.stringify({ connections: conns })
-              });
-              const data = await apiRes.json();
-              if (btn) btn.innerText = `✓ ${data.synced_count || conns.length} salvas!`;
-            } catch {
-              if (btn) btn.innerText = "✓ Conexões lidas";
+        const conns = await extractAllConnectionsWithAutoScroll(60);
+        chrome.runtime.sendMessage(
+          { action: "SYNC_CONNECTIONS", payload: conns },
+          (res: any) => {
+            if (chrome.runtime.lastError || !res?.ok) {
+              if (btn) btn.innerText = `✓ ${conns.length} lidas (painel offline?)`;
+            } else {
+              const synced = res.data?.synced_count ?? res.data?.synced ?? conns.length;
+              if (btn) btn.innerText = `✓ ${synced} sincronizadas!`;
             }
-          } else {
-            if (btn) btn.innerText = `✓ ${conns.length} lidas (conecte ao SaaS)`;
+            setTimeout(() => {
+              if (btn) btn.innerText = "📥 Extrair Conexões";
+            }, 3500);
           }
-          setTimeout(() => {
-            if (btn) btn.innerText = "📥 Extrair Conexões";
-          }, 3500);
-        });
+        );
       });
 
       document.getElementById("vbx-open-saas")?.addEventListener("click", () => {
-        window.open("http://localhost:3000", "_blank");
+        window.open("http://localhost:3001", "_blank");
       });
     }
 

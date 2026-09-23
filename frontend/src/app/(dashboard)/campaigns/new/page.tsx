@@ -1,16 +1,20 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   Sparkles,
   ArrowRight,
   Clock,
-  Sliders,
   CheckCircle2,
   Workflow,
+  Users,
+  AlertCircle,
+  Upload,
+  RefreshCw,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { Contact } from "@vibexcorp/api-client";
 
 export default function NewCampaignPage() {
   const router = useRouter();
@@ -21,6 +25,81 @@ export default function NewCampaignPage() {
   const [allowedEnd, setAllowedEnd] = useState("18:00");
   const [useRecommendedTemplate, setUseRecommendedTemplate] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
+
+  // Lista de contatos selecionáveis (todos marcados por padrão, decisão do
+  // usuário): quem não for marcado fica fora da cadência desta campanha.
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [contactsError, setContactsError] = useState<string | null>(null);
+
+  // Upload CSV/JSON direto daqui: importa pela mesma API da página de
+  // contatos e recarrega a lista já marcada.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const loadContacts = () => {
+    api
+      .listContacts()
+      .then(({ contacts: list }) => {
+        setContacts(list);
+        setSelectedIds(new Set(list.map((c) => c.id)));
+        setContactsError(null);
+      })
+      .catch((err: unknown) => {
+        setContactsError(err instanceof Error ? err.message : String(err));
+      });
+  };
+
+  useEffect(() => {
+    loadContacts();
+  }, []);
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // permite re-selecionar o mesmo arquivo
+    if (!file) return;
+
+    const ext = file.name.toLowerCase().split(".").pop();
+    if (ext !== "csv" && ext !== "json") {
+      setImportMsg({ ok: false, text: "Formato não suportado — use .csv ou .json (organize com scripts/list/normalize.mjs)." });
+      return;
+    }
+
+    setIsImporting(true);
+    setImportMsg(null);
+    try {
+      const res = await api.importContactsFile(file);
+      const n = res.inserted ?? res.imported ?? res.synced ?? 0;
+      setImportMsg({ ok: true, text: `✓ ${n} contatos importados de ${file.name} — confira abaixo.` });
+      loadContacts();
+    } catch (err: unknown) {
+      setImportMsg({
+        ok: false,
+        text: err instanceof Error ? err.message : `Falha ao importar ${file.name}.`,
+      });
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const toggleContact = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelectedIds((prev) =>
+      prev.size === contacts.length ? new Set() : new Set(contacts.map((c) => c.id))
+    );
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,6 +115,7 @@ export default function NewCampaignPage() {
         allowed_end_time: allowedEnd + ":00",
         timezone: "America/Sao_Paulo",
         is_flow_custom: !useRecommendedTemplate,
+        contact_ids: Array.from(selectedIds),
       });
 
       // If user chose recommended template, initialize recommended flow steps
@@ -197,6 +277,114 @@ export default function NewCampaignPage() {
           </div>
         </div>
 
+        {/* Lista de contatos: checkboxes, todos marcados por padrão */}
+        <div className="pt-2 border-t border-zinc-800/80">
+          <div className="flex items-center justify-between mb-2">
+            <label className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
+              <Users className="w-3.5 h-3.5 text-zinc-500" />
+              <span>Contatos desta Cadência</span>
+            </label>
+            <div className="flex items-center gap-3">
+              <span className="text-[10px] font-mono text-zinc-500">
+                {selectedIds.size} de {contacts.length} selecionados
+              </span>
+              {contacts.length > 0 && (
+                <button
+                  type="button"
+                  onClick={toggleAll}
+                  className="text-[10px] text-indigo-400 hover:text-indigo-300 transition"
+                >
+                  {selectedIds.size === contacts.length ? "Desmarcar todos" : "Marcar todos"}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Upload CSV/JSON aqui dentro — importa e já entra na seleção */}
+          <div className="flex items-center gap-2 mb-2.5">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.json"
+              className="hidden"
+              onChange={handleImportFile}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isImporting}
+              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-zinc-700 bg-zinc-800/60 text-xs font-medium text-zinc-200 hover:text-white hover:bg-zinc-800 transition disabled:opacity-60"
+            >
+              {isImporting ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Upload className="w-3.5 h-3.5" />
+              )}
+              <span>{isImporting ? "Importando..." : "Fazer Upload de Lista (CSV ou JSON)"}</span>
+            </button>
+            <span className="text-[10px] text-zinc-500">
+              lista do Google Sheets, Apollo, planilha — qualquer origem
+            </span>
+          </div>
+
+          {/* Resultado honesto do upload */}
+          {importMsg && (
+            <div
+              role="status"
+              className={`mb-2.5 px-3 py-2 rounded-lg border text-xs flex items-center justify-between ${
+                importMsg.ok
+                  ? "border-emerald-500/30 bg-emerald-950/20 text-emerald-300"
+                  : "border-red-500/30 bg-red-950/20 text-red-300"
+              }`}
+            >
+              <span className="font-mono break-all">{importMsg.text}</span>
+              <button
+                type="button"
+                onClick={() => setImportMsg(null)}
+                className="ml-3 text-[10px] opacity-70 hover:opacity-100 flex-shrink-0"
+              >
+                fechar
+              </button>
+            </div>
+          )}
+
+          {contactsError ? (
+            <div className="rounded-lg border border-red-500/30 bg-red-950/20 p-2.5 text-[11px] text-red-300 flex items-center gap-2">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+              <span className="font-mono break-all">{contactsError}</span>
+            </div>
+          ) : contacts.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-zinc-800 bg-[#141518] p-3 text-[11px] text-zinc-400">
+              Nenhum contato cadastrado ainda. Use o botão acima para importar sua lista (CSV ou JSON) — depois de importar, os contatos aparecem aqui já selecionados.
+            </div>
+          ) : (
+            <div className="rounded-lg border border-zinc-800 bg-[#0f1012] max-h-48 overflow-y-auto divide-y divide-zinc-800/60">
+              {contacts.map((c) => (
+                <label
+                  key={c.id}
+                  className="flex items-center gap-2.5 px-3 py-2 hover:bg-zinc-900/50 cursor-pointer transition"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c.id)}
+                    onChange={() => toggleContact(c.id)}
+                    className="w-3.5 h-3.5 accent-indigo-500"
+                  />
+                  <span className="text-xs text-zinc-200 font-medium truncate flex-1">
+                    {c.full_name || `${c.first_name} ${c.last_name}`}
+                  </span>
+                  <span className="text-[10px] text-zinc-500 truncate max-w-[140px]">
+                    {c.company || "—"}
+                  </span>
+                  <span className="text-[10px] font-mono text-zinc-600 uppercase">
+                    {c.status}
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+
         {/* Limits & Hours */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-zinc-800/80">
           <div>
@@ -232,11 +420,18 @@ export default function NewCampaignPage() {
           </div>
         </div>
 
-        <div className="flex justify-end pt-3">
+        <div className="flex items-center justify-between pt-3">
+          {/* Sem contato marcado o backend entenderia "todos" — bloqueamos e
+              avisamos, em vez de cadastrar uma cadência com escopo errado. */}
+          {contacts.length > 0 && selectedIds.size === 0 && (
+            <span className="text-[11px] text-amber-400">
+              Selecione ao menos um contato (ou cadastre contatos depois).
+            </span>
+          )}
           <button
             type="submit"
-            disabled={isCreating}
-            className="flex items-center space-x-1.5 px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition shadow-sm disabled:opacity-50"
+            disabled={isCreating || (contacts.length > 0 && selectedIds.size === 0)}
+            className="ml-auto flex items-center space-x-1.5 px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition shadow-sm disabled:opacity-50"
           >
             {isCreating ? (
               <span>Criando Campanha...</span>

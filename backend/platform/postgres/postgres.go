@@ -51,8 +51,10 @@ func (c *Client) ExecWithTenant(ctx context.Context, orgID uuid.UUID, fn func(tx
 	}
 	defer tx.Rollback(ctx)
 
-	// Set local session variable for Row Level Security (RLS)
-	_, err = tx.Exec(ctx, "SET LOCAL app.organization_id = $1", orgID.String())
+	// Set local session variable for Row Level Security (RLS). SET LOCAL nao
+	// aceita placeholder ($1) — por isso usamos set_config com parametro, que
+	// tem o mesmo efeito transacional (is_local=true) sem vazar para o pool.
+	_, err = tx.Exec(ctx, `SELECT set_config('app.organization_id', $1, true)`, orgID.String())
 	if err != nil {
 		return fmt.Errorf("failed to set tenant RLS context: %w", err)
 	}

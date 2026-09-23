@@ -415,3 +415,239 @@ Transformar o ecossistema VibexCorp LinkedIn Outreach em uma solução 100% func
 
 
 
+
+---
+
+## [2026-09-22] - Auditoria honestidade + Regra 09 + PRD-honestidade-conexao
+
+### 1. Objetivo da Sessão
+Auditar placeholders hardcoded de conexão (LinkedIn + extensão) no frontend/backend/banco; criar governança obrigatória de PRD + contexto persistente (Regra 09, AGENTS.md §4 item 7); emitir o PRD de correção. Skill graphify citada no CLAUDE.md global não está instalada — pendência registrada.
+
+### 2. Decisões de Arquitetura Tomadas
+1. **Diagnóstico (evidências):** `settings/page.tsx` fabrica `connected:true` no `catch`; `auth-context.tsx` cria sessão demo; `HandleConnectAccount` ignora `session_key`; `HandleExtensionStatus` lê seed `devices["current"]` do boot; `HandlePairExtension` aceita qualquer código len>=3; `ParseToken` aceita `demo_token`/64-chars; Postgres offline com `inMemoryStore` ativo; nenhum handler chama `ExecWithTenant` (RLS inoperante); seeds fake (5 contatos, preview, steps, camp-001); CORS autoriza tudo.
+2. **Governança (Regra 09):** ritual obrigatório por mudança não-trivial — PRD em `docs/prd/`, impacto nas rules 01–08, openapi.yaml junto, registro em `memory/` + `/graphify` quando instalado; checklist de review; template de PRD.
+3. **Plano de correção em fases:** A (contrato honesto sem banco) → B (Postgres verdade + RLS) → C (pareamento real) → D (auth sem backdoor) → E (limpeza de fakes). Detalhes em `docs/prd/PRD-honestidade-conexao.md`.
+
+### 3. Arquivos Criados ou Alterados
+- `.agents/rules/09_PRD_E_GOVERNANCA.md` [NEW]
+- `AGENTS.md` [EDIT — §4 item 7 ritual de governança]
+- `docs/prd/PRD-honestidade-conexao.md` [NEW]
+- `memory/001_registro_continuo_memoria.md` [APPEND — esta seção]
+
+### 4. Testes Executados e Resultados
+- Nenhum teste de código executado nesta etapa (etapa de auditoria + governança). Backend em `http://localhost:8080` (health alive, store in-memory); frontend VibexCorp em `http://localhost:3001` (200). Porta 3000 ocupada por outro projeto (alfa-engenharia).
+
+### 5. Status da Entrega (Definition of Done)
+- Fundação de governança entregue. Correção de código (fases A–E do PRD) pendente de aprovação/execução. Ação aberta: instalar skill graphify ou remover formalmente a pendência.
+
+---
+
+## [2026-09-22] - Plano infra local em D + graphify instalado
+
+### 1. Objetivo da Sessão
+Registrar no plano (PRD §4b + fases B0/B1) a decisão do usuário: servidor local SEM Docker, com todo o estado no disco D. Instalar a skill graphify (`uv tool install graphifyy` + `graphify install`, CLI v0.9.66; skill sincronizada via `graphify install --platform claude`) e construir o primeiro grafo em `graphify-out/` (575 nós, 1166 arestas, 49 comunidades).
+
+### 2. Decisões de Arquitetura Tomadas
+1. **Sem Docker, tudo em D:** Postgres via Scoop (18.6-3) com cluster em `D:\vibex\pgdata` na porta **5433**; Redis via Scoop (8.10.1) na porta **6380** com dados em `D:\vibex\redis`; scripts `scripts/local/{start,stop,status}.ps1`; caches npm/Next/Go/uv apontados para `D:\vibex\cache`. Scripts recusam boot sem `D:` montado.
+2. **Portas não-padrão (5433/6380/3001):** 5432/6379/3000 podem estar ocupadas por serviços alheios (ex.: Next da `alfa-engenharia` na 3000); backend continua na 8080.
+3. **PRD atualizado:** nova §4b (infra local em D), Fase B0 (scripts + caches) como pré-requisito da B1 (migrations `000001–000004` via `psql -f`), risco "Disco C contaminado" + mitigação via `status.ps1`.
+
+### 3. Arquivos Criados ou Alterados
+- `docs/prd/PRD-honestidade-conexao.md` [EDIT — §4b infra em D, B0/B1 renumeradas, risco C, Graphify executado]
+- `memory/001_registro_continuo_memoria.md` [APPEND — esta seção]
+- `graphify-out/` [NEW — graph.json, graph.html, GRAPH_REPORT.md]
+
+### 4. Testes Executados e Resultados
+- `graphify .` executado: AST 506 nós (após `uv tool install "graphifyy[sql]"`), semântico 35; `graphify query` smoke test OK.
+- `pg_ctl --version` (18.6), `redis-server --version` (8.10.1) verificados; portas 5432/6379 livres, 3000/3001 ocupadas (alfa-engenharia + VibexCorp). Nenhum teste Go/TS nesta etapa.
+
+### 5. Status da Entrega (Definition of Done)
+- Plano atualizado. Próximo passo: executar `scripts/local/start.ps1` (Fase B0) validando `status.ps1` verde, e então executar Fase A (contrato honesto) com TDD.
+
+---
+
+## [2026-09-22] - Scripts locais em D (Fase B0 — código, sem boot)
+
+### 1. Objetivo da Sessão
+Criar `scripts/local/{start,stop,status}.ps1` (infra local sem Docker, 100% disco D) conforme PRD §4b, sem executar boot (portas 8080/3001 ocupadas pelos servidores legados; boot real fica para a próxima sessão após `stop.ps1` dos legados).
+
+### 2. Decisões de Arquitetura Tomadas
+1. **Postgres 18 via Scoop** (`pg_ctl`/`initdb`/`psql` presentes), cluster `D:\vibex\pgdata:5433`, role+db idempotentes, migrations `*.up.sql` via `psql -v ON_ERROR_STOP=1 -f` em ordem de versão.
+2. **Redis 8 via Scoop** na `:6380` com `--dir D:\vibex\redis --appendonly yes`; `stop.ps1` mata só a 6380, nunca 6379 alheia.
+3. **API via `backend\bin\api.exe`** (compila se ausente) com env explícito no `Start-Process` (o Go não lê `.env`); **frontend** via `cmd /c npm run dev -- --port 3001` (npm é .cmd, redirect exige cmd).
+4. **Caches fora do C** via env no `start.ps1` (TEMP/TMP, npm_config_cache, GOCACHE, GOMODCACHE, UV_CACHE_DIR → `D:\vibex`).
+5. **`status.ps1`** checa D montado, pg_isready :5433, cluster em D, PING redis :6380, `/health` api, ausência de "in-memory resilient store" no boot log, frontend :3001 200, e porta 3000 intacta (alfa-engenharia). Arquivos `.ps1` sem acentos/em-dash (Windows PowerShell 5.1 lê ANSI e quebrava com UTF-8).
+6. **AGENTS.md §3** atualizado: `scripts/local/` na árvore + nota "dev local sem Docker (obrigatório)".
+
+### 3. Arquivos Criados ou Alterados
+- `scripts/local/start.ps1` [NEW]
+- `scripts/local/stop.ps1` [NEW]
+- `scripts/local/status.ps1` [NEW]
+- `AGENTS.md` [EDIT — §3 árvore + nota sem-Docker]
+- `docs/prd/PRD-honestidade-conexao.md` [EDIT anterior — §4b, B0/B1]
+- `memory/001_registro_continuo_memoria.md` [APPEND — esta seção]
+
+### 4. Testes Executados e Resultados
+- Validação de sintaxe dos 3 scripts via `[Parser]::ParseFile`: todos "sintaxe OK" (helper temporário removido após uso).
+- Boot real NÃO executado (adiado): 8080 ocupado pelo `api.exe` legado (PID 20300), 3001 pelo `next-server` VibexCorp legado (PID 27008). `start.ps1` detecta portas ocupadas e reaproveita — o boot limpo exige `stop.ps1` dos legados primeiro.
+
+### 5. Status da Entrega (Definition of Done)
+- Código da Fase B0 pronto, sintaxe validada. Pendente: boot real + `status.ps1` verde + `graphify . --update` (Regra 09) na próxima sessão.
+
+---
+
+## [2026-09-22] - Boot B0: bloqueio DLL Postgres + plano documentado no PRD
+
+### 1. Objetivo da Sessão
+Executar o boot da stack local em D (`stop.ps1` dos legados + `start.ps1`). Documentar no PRD o plano e o que falta, a pedido do usuário.
+
+### 2. Decisões e Descobertas
+1. **Legados parados:** `stop.ps1` derrubou `api.exe` (PID 20300, :8080) e `next start-server` (PID 27008, :3001). Portas 8080/3001/5433/6380 livres.
+2. **Bloqueio:** `initdb` do Scoop (PostgreSQL 18.6) falhou com `exception 0xC0000135` (DLL não encontrada) — `postgres.exe` exige o diretório bin no `PATH`; chamada por caminho absoluto não resolve as DLLs (icu/libpq).
+3. **Correção aplicada:** `start.ps1` agora põe `$PgBin` no `PATH` antes de `initdb`/`pg_ctl`/`psql`.
+4. **PRD:** §5 item 3 ganhou status do B0 + correção; nova §5.1 "Estado atual da execução" (tabela: B0 90%, B1/A1/A2/B2/C/D/E/openapi 0%) com o que falta por fase.
+
+### 3. Arquivos Alterados
+- `docs/prd/PRD-honestidade-conexao.md` [EDIT — §5 status B0, §5.1 tabela de execução]
+- `scripts/local/start.ps1` [EDIT — PATH do bin pg]
+- `memory/001_registro_continuo_memoria.md` [APPEND — esta seção]
+
+### 4. Testes Executados e Resultados
+- `stop.ps1`: OK (só os nossos PIDs; nada alheio tocado).
+- `start.ps1`: FALHOU no `initdb` (0xC0000135) antes de qualquer escrita relevante; `D:\vibex\pgdata` parcialmente criado — re-rodar `start.ps1` (o `initdb` falho deixa o dir sem `PG_VERSION`, e o script refaz).
+
+### 5. Status da Entrega (Definition of Done)
+- B0 ainda 90%: falta re-rodar `start.ps1` com o PATH corrigido e `status.ps1` verde. Próximos passos na §5.1 do PRD.
+
+---
+
+## [2026-09-22] - B0 concluída (stack 100% disco D) + B1 concluída (migrations + RLS smoke)
+
+### 1. Objetivo da Sessão
+Subir a stack local (Fase B0) e o banco com migrations + RLS validado (Fase B1), mantendo a regra do usuário: **nada instala no disco C** — tudo autocontido em `D:\vibex`.
+
+### 2. Decisões e Descobertas
+1. **Runtime autocontido em D:** `D:\vibex\tools\pgsql` (Postgres 18.6, bin/lib/share copiados do Scoop) + `D:\vibex\tools\redis` (`redis-server.exe`, `redis-cli.exe`, DLLs msys). `start.ps1`/`stop.ps1`/`status.ps1` apontam exclusivamente para D (sem fallback para o Scoop). Causa raiz do `0xC0000135`: o pacote Scoop do Postgres **não trouxe `libxml2.dll`** (importada pelo `postgres.exe`); a DLL veio do PostgreSQL 16 EDB local e vive na cópia de D; o patch feito no Scoop do C foi revertido (C ficou como estava).
+2. **Deadlock de pipe nativo:** `& pg_ctl start | Out-Null` trava quando o stdout do script está redirecionado (execução em background) — trocado por `Start-Process` com redirect de arquivo. Além disso, `Start-Process -Wait` no `pg_ctl start` trava esperando o postgres **daemonizado** (que nunca "termina") — `-Wait` removido; o gate de readiness é o `Wait-Port`.
+3. **Start-Process exige stdout/stderr em arquivos distintos** — corrigido para redis/api/frontend (`api.log` + `api.err.log`, etc.).
+4. **redis-server e `--dir`:** backslashes são consumidos pelo parser de args (`D:vibexredis`) — corrigido com `-WorkingDirectory "D:\vibex\redis"` e sem `--dir` (dump.rdb + appendonlydir caem na cwd).
+5. **RLS real:** `vibex_admin` criado **sem SUPERUSER** (superuser bypassa RLS sempre). Com `FORCE ROW LEVEL SECURITY`, o próprio dono das tabelas fica sujeito às policies. `start.ps1` faz `ALTER ROLE ... NOSUPERUSER` se a role já existir.
+6. **Migration `000005_seed_dev_owner`:** org `vibexcorp-dev` + usuário `admin@vibexcorp.com` (role `owner`, hash bcrypt de `admin123` gerado pela própria lib do projeto: `$2a$10$w9D39...`). O INSERT em `users` exige `BEGIN` + `set_config('app.organization_id', id, true)` (FORCE RLS).
+7. **status.ps1:** `/health` passou a usar `Invoke-WebRequest` (`Invoke-RestMethod` depende de `System.Web`, ausente no PS 5.1).
+
+### 3. Arquivos Criados ou Alterados
+- `scripts/local/start.ps1` [EDIT — runtimes de D, deadlock de pipe, `-Wait` do pg_ctl, redis via cwd, role NOSUPERUSER, redirects distintos]
+- `scripts/local/stop.ps1` [EDIT — pg_ctl de D]
+- `scripts/local/status.ps1` [EDIT — pg_isready/redis-cli de D, /health sem System.Web]
+- `backend/db/migrations/000005_seed_dev_owner.up.sql` [NEW]
+- `backend/db/migrations/000005_seed_dev_owner.down.sql` [NEW]
+- `docs/prd/PRD-honestidade-conexao.md` [EDIT — §5 item 3/4 status final + §5.1 tabela]
+- `memory/001_registro_continuo_memoria.md` [APPEND — esta seção]
+
+### 4. Testes Executados e Resultados
+- `status.ps1`: **8/8 verdes** (exit 0) — disco D, pg :5433, dados em D, redis PONG, api alive, sem fallback in-memory, frontend HTTP 200, porta 3000 (alfa-engenharia) intacta.
+- Migrations `000001`–`000005` aplicadas com exit 0 (16 tabelas em `public`).
+- **Smoke RLS** (como `vibex_admin`, dono NOSUPERUSER): sem contexto → `users`=0 e `contacts`=0; com ctx org1 → 1; org2 criada + usuário probe → org1 vê só a sua (1), org2 vê só a sua (1); limpeza do probe OK.
+- Compilação da API (`go build`) 49s com `GOCACHE`/`GOMODCACHE` em `D:\vibex\cache`.
+
+### 5. Status da Entrega (Definition of Done)
+- **B0 e B1 concluídas.** Stack no ar: postgres :5433 (migrations + RLS), redis :6380, api :8080 (banco real), frontend :3001.
+- Próximas fases: **A2** (backend honesto com TDD: 503 `STORE_UNAVAILABLE`, remoção do seed `devices["current"]`), **A1** (frontend honesto), B2 (tenant em todo handler), C (pareamento real), D (auth sem backdoor), E (limpeza de fakes), openapi.yaml.
+
+---
+
+## [2026-09-22] - Fase A2 concluída: backend honesto com TDD + policies pre-tenant
+
+### 1. Objetivo da Sessão
+Implementar a Fase A2 do PRD-honestidade-conexao com TDD: fim do seed de dispositivo no boot, fim do bootstrap/backdoor de login, `503 STORE_UNAVAILABLE` sem Postgres, `404` real em código de pareamento inválido, `OFFLINE` sem device, e pareamento E2E funcional sobre o RLS.
+
+### 2. Decisões de Arquitetura Tomadas
+1. **TDD red→green:** `backend/internal/tests/honesty_test.go` [NEW] com 6 testes (`pgClient = nil` → 503 `STORE_UNAVAILABLE`, sem payload fabricado; login sem token de bootstrap). Rodaram vermelhos contra o código antigo (que fabricava token/connected/CONNECTED) e verdes após a correção.
+2. **Remoções em `handlers.go`:** seed `devices["current"]` do `NewServer`; bootstrap de login (usuário default + `admin123`); backdoor universal `req.Password != "admin123"` (agora bcrypt estrito via `CheckPassword`); fallback in-memory do `HandleExtensionStatus`; registro fictício de device em memória no pair.
+3. **Contrato novo:** sem store → `503 STORE_UNAVAILABLE` (pair, pairing-code, connect, status, login); código inexistente/expirado/consumido → `404 INVALID_PAIRING_CODE`; `connected` = device `active` com heartbeat < 2 min; sem device → `OFFLINE` (200).
+4. **RLS revelou bug mascarado pelo bootstrap:** com `vibex_admin` NOSUPERUSER, SELECT/INSERT sem `app.organization_id` retornam 0 linhas/falham — o antigo bootstrap escondia isso. Padrão aplicado: transação + `set_config(..., true)` (nunca na conexão poolada, que vazaria estado).
+5. **Policies pre-tenant (migrations novas):** `000006_login_lookup_policy` (SELECT em users com `app.login_lookup`), `000007_pairing_lookup_policy` (SELECT/UPDATE em extension_devices com `app.pairing_lookup` — a extensão não tem JWT; o código efêmero é a credencial), `000008_device_lookup_policy` (heartbeat resolve o device **por `token_hash`** com `app.device_lookup` — sem depender dos claims fabricados pelo backdoor de 64-chars do `ParseToken`).
+6. **`ParseToken` (64-chars/demo_token) ainda fabrica claims** — fica para a Fase D; os handlers de device não dependem mais deles.
+
+### 3. Arquivos Criados ou Alterados
+- `backend/internal/tests/honesty_test.go` [NEW]
+- `backend/internal/api/handlers.go` [EDIT — NewServer, HandleLogin, HandleConnectAccount, HandleGeneratePairingCode, HandlePairExtension, HandleExtensionHeartbeat, HandleExtensionStatus]
+- `backend/db/migrations/000006_login_lookup_policy.{up,down}.sql` [NEW]
+- `backend/db/migrations/000007_pairing_lookup_policy.{up,down}.sql` [NEW]
+- `backend/db/migrations/000008_device_lookup_policy.{up,down}.sql` [NEW]
+- `docs/prd/PRD-honestidade-conexao.md` [EDIT — §5 item 2 status final + §5.1]
+- `memory/001_registro_continuo_memoria.md` [APPEND — esta seção]
+
+### 4. Testes Executados e Resultados
+- `go vet ./...`: zero erros. `go test ./internal/tests/`: 15/15 PASS (9 antigos + 6 honestidade).
+- E2E ao vivo (API reconstruída e reiniciada na :8080): login correto **200** (bcrypt do usuário seedado); senha errada **401**; usuário inexistente **401** (backdoor admin123 universal morto); pairing-code **200**; pair com código real **200**; status pós-pair **`CONNECTED`/connected:true** com device real; heartbeat com extension_token **200** (resolve por token_hash); heartbeat com token falso **401**.
+
+### 5. Status da Entrega (Definition of Done)
+- **A2 concluída.** Pendentes: **A1** (limpar `catch`-fabrica-sucesso do frontend), **B2** (helper de tenant para os demais handlers — connect/contacts/campaigns ainda gravam sem contexto), **C** (evidência no connect → `428`), **D** (remover `demo_token`/64-chars do `ParseToken` + sessão demo no frontend), **E** (fakes), **openapi.yaml** (`STORE_UNAVAILABLE`/`EVIDENCE_REQUIRED` + `428`).
+
+---
+
+## [2026-09-22] - Fases A1+B2+C+D+E+openapi concluídas: PRD implementado
+
+### 1. Objetivo da Sessão
+Concluir o PRD-honestidade-conexao na ordem A1→B2→C→D→E→openapi/cliente→encerramento, cada fase com TDD e gates (`go vet`, `go test`, `tsc --noEmit`), atualizando §5.1 e apensando a memória.
+
+### 2. Decisões de Arquitetura Tomadas
+1. **A1 — frontend honesto:** vitest + testing-library; removidos os 3 `catch`-fabrica-sucesso de `settings/page.tsx` (incluindo `Math.random()` de pairing) e a sessão demo/`fallbackUser` de `auth-context.tsx`; erros reais (`accountError`/`extError`/`pairingError` com `role="alert"`) chegam à UI. 5 testes settings + 3 auth (8/8 verdes).
+2. **B2 — tenant em todo handler:** padrão `tenantOr401` (401 sem tenant, sem fallback para org default) + `withTenantDB` (transação com tenant; sentinelas distinguem 404/428 de 503). Todos os handlers de leitura/escrita migrados (accounts, contacts CRUD/CSV/sync com COPY+dedup, campaigns CRUD/steps/start/pause/resume/killswitch, dashboard, outreach, conversations, activity, templates). Cross-tenant verde (`cross_tenant_test.go`) + 401 sem tenant (`honesty_test.go`).
+3. **C — pareamento real:** connect exige evidência (device active com heartbeat <=2min OU `session_key` não-vazia), senão `428 EVIDENCE_REQUIRED`; status OFFLINE sem device, ONLINE só com heartbeat recente; código inválido/expirado/consumido → `404 INVALID_PAIRING_CODE`. E2E vivo (`pairing_e2e_test.go`).
+4. **D — auth sem backdoor:** `ParseToken` só JWT HS256 (`demo_token_vibex_2026` e 64-chars mortos); rota `POST /auth/demo-token` removida; login bcrypt estrito sem bootstrap; frontend sem auto-sessão demo; popup da extensão só com formulário de pairing-code. 5 testes Go (`auth_e2e_test.go`) + 3 vitest.
+5. **E — limpeza de fakes:** `inMemoryStore` removido (tipo+campo+init+import `sync`); `HandleCampaignPreview` com render real sobre contatos reais; exemplos de template zerados; empty-states honestos reutilizados. Migration `000009_worker_schedule_policy` (worker multi-tenant por org com kill-switch).
+6. **openapi+cliente:** `ErrorEnvelope` com os códigos honestos + 6 paths novos (accounts/current, accounts/connect com 428, pairing-code, pair com 404, status, heartbeat com 401); `packages/api-client` com `ApiError{code,status,details}` em vez de `Error` genérico; `tsc --noEmit` limpo nos dois projetos.
+
+### 3. Arquivos Criados ou Alterados
+- `frontend/src/app/(dashboard)/settings/page.tsx`, `frontend/src/lib/auth-context.tsx`, `frontend/src/test/settings-honest.test.tsx` [NEW], `frontend/src/test/auth-honest.test.tsx` [NEW] (A1/D)
+- `backend/internal/api/handlers.go` (B2/C/D/E), `backend/internal/api/router.go` (D), `backend/internal/auth/auth.go` (D), `backend/platform/postgres/postgres.go` (fix `set_config` transacional)
+- `backend/internal/tests/cross_tenant_test.go`, `pairing_e2e_test.go`, `auth_e2e_test.go` [NEW] (B2/C/D)
+- `backend/db/migrations/000009_worker_schedule_policy.{up,down}.sql` [NEW] (E)
+- `frontend/src/app/(dashboard)/campaigns/[id]/builder/page.tsx`, `templates/page.tsx`, `inbox/page.tsx` (E)
+- `linkedinexus/ext/src/popup/App.tsx` (D)
+- `api/openapi.yaml`, `packages/api-client/src/index.ts` (openapi)
+- `docs/prd/PRD-honestidade-conexao.md` (status `implementado`, §5 itens 5–8 + §5.1 + §3 débitos + DoD §7)
+- `memory/001_registro_continuo_memoria.md` [APPEND — esta seção]
+
+### 4. Testes Executados e Resultados
+- `go vet ./...`: limpo. `go test ./...` sem cache: 25 testes `internal/tests` PASS (incluindo CrossTenant, Pairing E2E, AuthD).
+- `npm test -- --run` (frontend): 8/8 (settings 5 + auth 3). `tsc --noEmit` frontend limpo; `tsc --noEmit -p` do api-client limpo. `go build ./...` OK.
+- Migration 000009 aplicada no banco local e confirmada em `pg_policies`. `graphify update .` e `graphify update linkedinexus` OK (exit 0, graph.json com directed/multigraph/nodes/links).
+
+### 5. Status da Entrega (Definition of Done)
+- **PRD `implementado` (2026-09-22).** Todas as fases 100% (§5.1). DoD §7 todo marcado. Débitos cosméticos anotados no PRD §3 (`daily_limit` hardcodado em settings, CORS aberto em dev) — fora deste PRD, sem implementar.
+
+---
+
+## [2026-09-23] - Verificacao pos-PRD + commit do working tree (Prossiga)
+
+### 1. Objetivo da Sessao
+Atender ao "Prossiga": reconciliar o plano (.zcode/plans, que listava A1/B2/C/D/E como falta) com o PRD que ja marcava tudo implementado, verificar o estado real do working tree (~34 modificados + arquivos novos) e encerrar com gates verdes + commit.
+
+### 2. Descobertas (evidencia medida, nao probabilidade)
+1. **Plano .zcode desatualizado:** o plano sess_fdad88d0 listava A1/B2/C/D/E/openapi como falta, mas o codigo ja continha tudo (TDD, RLS, 503/404/428 honestos). Plano tratado como obsoleto, nao como ordem de execucao.
+2. **Working tree era o PRD + evolucao pos-PRD:** diff contra HEAD (que ainda tem `demo_token`/`admin123`/64-chars em auth.go) mostra o trabalho inteiro nao commitado: backend honesto, tenant em todo handler, pareamento real, auth sem backdoor, preview honesto, openapi + ApiError, ext WXT migrada (src/ -> entrypoints/), scripts D, Regra 09.
+3. **Evolucao pos-PRD identificada (fora do escopo original, ja no tree):** migrations 000010 (platform_settings por org — limites da settings persistidos, fim do salvar-fake) e 000011 (RLS em organizations), `handlers_settings.go` + `assist.go` (proxy Typesafe/Jev com chave so no backend), `HandleDownloadExtension`, heartbeat movido para grupo publico (autentica por token_hash, nao JWT), Redis opcional no main, `RemainingToday` no ratelimit, teste extension-honest + pipeline/daily-limits/assist no backend. Nada disso tinha PRD proprio — registrado aqui como precedente para a Regra 09 exigir PRD curto retroativo na proxima mudanca nao-trivial correlata.
+4. **Contrato quase completo:** `writeAPIError` emite 18 codigos; o enum do openapi cobre 15. Faltam no enum: AUTH_TOKEN_GENERATION_FAILED, AUTH_TOKEN_REFRESH_FAILED, EXTENSION_NOT_FOUND. Sem impacto funcional (ApiError propaga qualquer code), mas anotado como debito para alinhar no proximo toque no openapi.
+5. **Higiene de commit:** `.env.parsed` contem TYPESAFE_API_KEY real + JWT/DB/Redis locais — NAO commitado (adicionado ao .gitignore). `frontend/tsconfig.tsbuildinfo`, `ext/vibexcorp-extension.zip` (binario gerado) e `package-lock.json` (ruido) tambem fora do commit.
+
+### 3. Gates executados (resultado real)
+- `go vet ./...`: limpo (exit 0).
+- `go test ./internal/tests/ -v`: 30 testes PASS (auth D 5, cross-tenant 2, pairing E2E 2, honesty 7, pipeline 3, daily-limits, assist, safety, templates, capabilities).
+- `go test ./...`: ok (unico pacote com testes = internal/tests).
+- `npx vitest run` (frontend): 3 arquivos, 13/13 PASS (settings 6, extension 4, auth 3; memoria anterior citava 8 — houve +5 testes desde entao).
+- `npx tsc --noEmit` (frontend): exit 0. `tsc` em packages/api-client e ext: sem tsc local instalado (npx ofereceu instalar); nao executado para nao contaminar — coberto pelo tsc do frontend que consome o cliente.
+- Greps de honestidade: zero `Math.random` como pairing fora de comentario/teste; zero `connected:true` fabricado fora de teste; `demo_token`/`fallbackUser`/`HandleDemoToken` so em comentarios NOTA Fase D.
+
+### 4. Commit realizado
+- Commit do working tree verificado (sem .env.parsed, sem tsbuildinfo, sem zip, sem package-lock): mensagem `feat: PRD-honestidade-conexao implementado (A1/B2/C/D/E + openapi) + settings reais + assist Jev`.
+- PRD segue `implementado`; tabela §5.1 continua valida; debitos atualizados: enum openapi x writeAPIError (3 codigos) + PRD retroativo curto para 000010/000011/assist na proxima mudanca correlata. Debitos antigos quitados: `daily_limit` agora persiste (000010 + handlers_settings), restando so CORS aberto em dev.
+- DoD AGENTS.md: itens 1–3 verdes (vet/test/tsc/vitest + RLS cross-tenant); item 4–5 cobertos por pipeline_test (idempotencia + stop-on-reply); item 6 este apendice; item 7 parcial (PRD existe e memoria apensada; precedente novo registrado acima; graphify --update nao executado — sem binario no PATH desta sessao).
+
+### 5. Proximos passos sugeridos (fora deste turno)
+1. Alinhar os 3 codigos faltantes no enum do openapi.yaml.
+2. PRD curto retroativo (ou apendice neste) para 000010/000011/assist/downloads antes da proxima feature correlata.
+3. `graphify . --update` quando o binario estiver disponivel.
+4. Push para origin/main (rede GitHub nao testada nesta sessao).

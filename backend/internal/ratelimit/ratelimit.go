@@ -78,3 +78,21 @@ func (rl *RateLimiter) RecordExecution(ctx context.Context, accountID uuid.UUID)
 	_, err := pipe.Exec(ctx)
 	return err
 }
+
+// RemainingToday devolve o saldo diário restante da conta (teto efetivo -
+// executados hoje). Erro de Redis é propagado para o chamador decidir.
+func (rl *RateLimiter) RemainingToday(ctx context.Context, accountID uuid.UUID, userDailyLimit int) (int, error) {
+	effectiveLimit := EffectiveDailyLimit(userDailyLimit)
+	today := time.Now().Format("2006-01-02")
+	counterKey := fmt.Sprintf("rate:%s:daily:%s", accountID.String(), today)
+
+	currentCount, err := rl.redisClient.Rdb.Get(ctx, counterKey).Int()
+	if err != nil && err.Error() != "redis: nil" {
+		return 0, err
+	}
+	remaining := effectiveLimit - currentCount
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, nil
+}

@@ -27,8 +27,197 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LoginResponse'
+        '400':
+          description: Corpo inválido / credencial ausente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '401':
-          description: Credenciais inválidas
+          description: Credenciais inválidas (bcrypt estrito, sem backdoor)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline (sem bootstrap de usuário)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /accounts/current:
+    get:
+      summary: Conta LinkedIn atual do tenant
+      tags: [Account]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Conta (nunca conectada = disconnected honesto)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkedInAccount'
+        '401':
+          description: Sem sessão com organização (sem fallback default)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /accounts/connect:
+    post:
+      summary: Conectar conta LinkedIn (exige evidência verificável)
+      tags: [Account]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name:
+                  type: string
+                profile_url:
+                  type: string
+                session_key:
+                  type: string
+                  description: Credencial de sessão verificável (alternativa ao device ativo)
+      responses:
+        '200':
+          description: Conta conectada
+        '401':
+          description: Sem sessão com organização
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '428':
+          description: Sem evidência (EVIDENCE_REQUIRED) — sem device ativo com heartbeat recente e sem session_key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /extension/pairing-code:
+    post:
+      summary: Gerar código de pareamento (10 min, tenant)
+      tags: [Extension]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Código gerado
+        '401':
+          description: Sem sessão com organização
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /extension/pair:
+    post:
+      summary: Parear extensão via código (pré-tenant, credencial = código efêmero)
+      tags: [Extension]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pairing_code:
+                  type: string
+                device_name:
+                  type: string
+      responses:
+        '200':
+          description: Device ativo + extension_token + api_jwt (JWT 72h para /messaging/* e /assist/*)
+        '400':
+          description: Código malformado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Código inexistente, expirado ou consumido (INVALID_PAIRING_CODE)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /extension/status:
+    get:
+      summary: Status da extensão do tenant
+      tags: [Extension]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: CONNECTED (device ativo + heartbeat <= 2min) ou OFFLINE honesto
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtensionStatus'
+        '401':
+          description: Sem sessão com organização
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /extension/heartbeat:
+    post:
+      summary: Heartbeat do device (autentica por token_hash, sem JWT)
+      tags: [Extension]
+      responses:
+        '200':
+          description: Heartbeat persistido
+        '401':
+          description: Token ausente ou device desconhecido/inativo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
 
   /dashboard/metrics:
     get:
@@ -219,6 +408,176 @@ paths:
               schema:
                 $ref: '#/components/schemas/TemplateRenderResult'
 
+  /messaging/pending-outreach:
+    get:
+      summary: Próximo job enfileirado pelo worker (extensão faz polling)
+      tags: [Messaging]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Job real (mensagem renderizada) ou vazio honesto
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  has_campaign:
+                    type: boolean
+                  campaign_id:
+                    type: string
+                  campaign_name:
+                    type: string
+                  queue_remaining:
+                    type: integer
+                  daily_remaining:
+                    type: integer
+                  job:
+                    type: object
+                    nullable: true
+                    properties:
+                      job_id: { type: string }
+                      contact_id: { type: string }
+                      first_name: { type: string }
+                      last_name: { type: string }
+                      full_name: { type: string }
+                      company: { type: string }
+                      job_title: { type: string }
+                      linkedin_url: { type: string }
+                      rendered_message: { type: string }
+        '401':
+          description: Sem sessão com organização
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Postgres offline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /messaging/report-sent:
+    post:
+      summary: Extensão confirma entrega (ou reporta erro para retry)
+      tags: [Messaging]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                job_id:
+                  type: string
+                  description: Job enfileirado pelo worker (caminho do pipeline real)
+                contact_id:
+                  type: string
+                recipient_name:
+                  type: string
+                message_body:
+                  type: string
+                linkedin_url:
+                  type: string
+                error:
+                  type: string
+                  description: Não vazio = falha na entrega → retry (3 tentativas)
+      responses:
+        '200':
+          description: recorded | retry_scheduled | failed_stopped | already_recorded
+        '400':
+          description: VALIDATION_FAILED
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Job/contato de outro tenant ou inexistente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /assist/humanize:
+    post:
+      summary: Parâmetros de comportamento humano (proxy Typesafe/Jev ou fallback)
+      description: A chave da Typesafe nunca sai do backend; state enviado é estrutural (sem credenciais). assist_available=false + source=fallback quando o assist não participa.
+      tags: [Assist]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                selectors:
+                  type: array
+                  items:
+                    type: string
+                page_fingerprint:
+                  type: string
+                language:
+                  type: string
+      responses:
+        '200':
+          description: HumanizeParams (assisted ou fallback honesto)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanizeParams'
+
+  /settings/daily-limits:
+    get:
+      summary: Limites globais do tenant (organizations.platform_settings)
+      tags: [Settings]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Limite diário + janela + teto do servidor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyLimits'
+    put:
+      summary: Persistir limites globais (fim do "salvar" fake)
+      tags: [Settings]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DailyLimits'
+      responses:
+        '200':
+          description: saved
+        '400':
+          description: VALIDATION_FAILED (5..50, HH:MM, timezone)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /downloads/extension.zip:
+    get:
+      summary: Pacote da extensão para o botão "Baixar" da página /extension
+      tags: [Extension]
+      responses:
+        '200':
+          description: application/zip
+        '404':
+          description: EXTENSION_NOT_FOUND (zip não construído)
+
 components:
   securitySchemes:
     BearerAuth:
@@ -227,6 +586,107 @@ components:
       bearerFormat: JWT
 
   schemas:
+    HumanizeParams:
+      type: object
+      properties:
+        assist_available:
+          type: boolean
+        source:
+          type: string
+          enum: [typesafe, fallback]
+        click_delay_ms: { type: integer }
+        type_cps_min: { type: number }
+        type_cps_max: { type: number }
+        pause_every_min_chars: { type: integer }
+        pause_every_max_chars: { type: integer }
+        pause_ms_min: { type: integer }
+        pause_ms_max: { type: integer }
+        mouse_steps_min: { type: integer }
+        mouse_steps_max: { type: integer }
+        scroll_dwell_ms: { type: integer }
+        suggested_selector: { type: string }
+        page_state: { type: string }
+        confidence: { type: number }
+    DailyLimits:
+      type: object
+      properties:
+        daily_limit:
+          type: integer
+          minimum: 5
+          maximum: 50
+        allowed_start_time:
+          type: string
+          example: "08:00"
+        allowed_end_time:
+          type: string
+          example: "18:00"
+        timezone:
+          type: string
+        server_max_limit:
+          type: integer
+        server_min_limit:
+          type: integer
+    ErrorEnvelope:
+      type: object
+      description: Envelope honesto de erro (fases A2–D)
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [STORE_UNAVAILABLE, UNAUTHENTICATED, AUTH_INVALID_CREDENTIALS, INVALID_PAIRING_CODE, EVIDENCE_REQUIRED, CONTACT_NOT_FOUND, CAMPAIGN_NOT_FOUND, CONVERSATION_NOT_FOUND, INVALID_REQUEST, VALIDATION_FAILED, INVALID_CAMPAIGN_ID, INVALID_CONTACT_ID, INVALID_CONVERSATION_ID, FILE_REQUIRED, CSV_PARSE_FAILED]
+            message:
+              type: string
+            details:
+              type: object
+
+    LinkedInAccount:
+      type: object
+      properties:
+        connected:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        connection_status:
+          type: string
+        circuit_breaker_state:
+          type: string
+        daily_limit:
+          type: integer
+        last_seen_at:
+          type: string
+          format: date-time
+          nullable: true
+        capabilities:
+          type: object
+          properties:
+            profile_read:
+              type: boolean
+            connections_read:
+              type: boolean
+            messaging_available:
+              type: boolean
+
+    ExtensionStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [CONNECTED, OFFLINE]
+        connected:
+          type: boolean
+        device_name:
+          type: string
+        last_seen_at:
+          type: string
+          format: date-time
+          nullable: true
     LoginRequest:
       type: object
       required: [email, password]

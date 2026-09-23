@@ -38,14 +38,19 @@ func (s *Server) SetupRouter() *chi.Mux {
 	// Health and Ready probes (unauthenticated)
 	r.Get("/health", s.HandleHealth)
 	r.Get("/ready", s.HandleReady)
+	// Pacote da extensão para o botão "Baixar" da página /extension do painel.
+	r.Get("/api/v1/downloads/extension.zip", s.HandleDownloadExtension)
 
 	// API v1 group
 	r.Route("/api/v1", func(r chi.Router) {
-		// Public Auth & Pairing
+		// Public Auth & Pairing (NOTA Fase D: /auth/demo-token removido —
+		// emissor de JWT sem credencial; pareamento é só via /extension/pair)
 		r.Post("/auth/login", s.HandleLogin)
 		r.Post("/auth/logout", s.HandleLogout)
-		r.Post("/auth/demo-token", s.HandleDemoToken)
 		r.Post("/extension/pair", s.HandlePairExtension)
+		// Heartbeat autentica pelo token do device (token_hash), NÃO por JWT:
+		// ficar no grupo protegido rejeitava o heartbeat real da extensão.
+		r.Post("/extension/heartbeat", s.HandleExtensionHeartbeat)
 		r.Post("/templates/preview", s.HandleTemplatePreview)
 
 		// Protected Routes
@@ -70,7 +75,6 @@ func (s *Server) SetupRouter() *chi.Mux {
 
 			// Browser Extension
 			r.Post("/extension/pairing-code", s.HandleGeneratePairingCode)
-			r.Post("/extension/heartbeat", s.HandleExtensionHeartbeat)
 			r.Get("/extension/status", s.HandleExtensionStatus)
 
 			// Contacts
@@ -85,6 +89,14 @@ func (s *Server) SetupRouter() *chi.Mux {
 			r.Get("/messaging/pending-outreach", s.HandleGetPendingOutreach)
 			r.Post("/messaging/report-sent", s.HandleReportSentMessage)
 			r.Post("/messaging/report-reply", s.HandleReportReply)
+
+			// Assist de automação humana (proxy Typesafe/Jev — chave nunca
+			// sai do backend; a extensão consome via este endpoint).
+			r.Post("/assist/humanize", s.HandleAssistHumanize)
+
+			// Limites globais reais (slider/janela da tela de settings).
+			r.Get("/settings/daily-limits", s.HandleGetDailyLimits)
+			r.Put("/settings/daily-limits", s.HandleSaveDailyLimits)
 
 			// Conversations & Inbox
 			r.Get("/conversations", s.HandleListConversations)

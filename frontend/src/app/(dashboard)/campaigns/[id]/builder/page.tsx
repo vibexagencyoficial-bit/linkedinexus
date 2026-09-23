@@ -42,6 +42,7 @@ export default function CampaignFlowBuilderPage() {
   const [campaignStatus, setCampaignStatus] = useState("draft");
   const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [previewResult, setPreviewResult] = useState<CampaignPreviewResult | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
@@ -114,22 +115,18 @@ export default function CampaignFlowBuilderPage() {
   const handleOpenPreview = async () => {
     setShowPreviewModal(true);
     setIsLoadingPreview(true);
+    setPreviewError(null);
     try {
       const res = await api.previewCampaign(campaignId);
       setPreviewResult(res);
-    } catch {
-      // Offline fallback: render with available variables
+    } catch (err: any) {
+      // Sem fallback fictício (Fase E): erro real vira previews vazios +
+      // can_launch=false, e a mensagem chega à UI em vez de contato fake.
       setPreviewResult({
-        previews: [
-          {
-            contact_name: "Conexão Real do LinkedIn",
-            company: "Empresa do Contato",
-            rendered: nodes.find((n) => n.type === "message")?.templateBody || "Mensagem de demonstração",
-            blocked: false,
-          },
-        ],
-        can_launch: true,
+        previews: [],
+        can_launch: false,
       });
+      setPreviewError(err?.message || "Falha ao gerar preview. Verifique a conexão.");
     } finally {
       setIsLoadingPreview(false);
     }
@@ -497,6 +494,16 @@ export default function CampaignFlowBuilderPage() {
               </div>
             ) : previewResult ? (
               <div className="space-y-4">
+                {previewError && (
+                  <div role="alert" className="rounded-lg border border-red-500/30 bg-red-950/40 p-3 text-xs text-red-300">
+                    {previewError}
+                  </div>
+                )}
+                {previewResult.previews.length === 0 ? (
+                  <div className="rounded-lg border border-zinc-800 bg-[#16171a] p-6 text-center text-xs text-zinc-400">
+                    Nenhum contato na cadência para pré-visualizar. Adicione contatos à campanha antes de lançar.
+                  </div>
+                ) : (
                 <div className="space-y-3 max-h-72 overflow-y-auto">
                   {previewResult.previews.map((item, idx) => (
                     <div
@@ -525,6 +532,7 @@ export default function CampaignFlowBuilderPage() {
                     </div>
                   ))}
                 </div>
+                )}
 
                 <div className="flex items-center justify-between pt-2 border-t border-zinc-800">
                   <span className="text-[11px] text-zinc-400">

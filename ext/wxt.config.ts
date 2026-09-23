@@ -10,7 +10,7 @@ export default defineConfig({
     host_permissions: [
       "*://*.linkedin.com/*",
       "http://localhost:8080/*",
-      "http://localhost:3000/*"
+      "http://localhost:3001/*"
     ],
     action: {
       default_title: "VibexCorp Outreach",

@@ -15,6 +15,7 @@ import (
 	"github.com/vibexcorp/linkedin-outreach/backend/internal/safety"
 	"github.com/vibexcorp/linkedin-outreach/backend/platform/logger"
 	"github.com/vibexcorp/linkedin-outreach/backend/platform/postgres"
+	redisplatform "github.com/vibexcorp/linkedin-outreach/backend/platform/redis"
 )
 
 func main() {
@@ -47,11 +48,29 @@ func main() {
 		defer pgClient.Close()
 	}
 
+	// Redis opcional: alimenta o rate limiter do worker (teto diário +
+	// cooldown). Sem Redis a API sobe igual, mas o worker não despacha —
+	// não é possível respeitar o limite de segurança sem contador.
+	var redisClient *redisplatform.Client
+	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+		// redisplatform.New já aplica timeout interno de 5s no Ping.
+		redisClient, err = redisplatform.New(redisURL)
+		if err != nil {
+			log.Warn("Redis offline — worker fica sem rate limiter e não despachará envios.", "error", err)
+			redisClient = nil
+		} else {
+			log.Info("connected to Redis successfully (rate limiter ativo)")
+			defer redisClient.Close()
+		}
+	}
+
+	extensionZip := os.Getenv("EXTENSION_ZIP_PATH")
+
 	authService := auth.NewService(jwtSecret, 72*time.Hour)
 	safetyService := safety.NewPlatformSafetyService()
 	broker := events.NewBroker()
 
-	server := api.NewServer(pgClient, authService, safetyService, broker)
+	server := api.NewServerWithRedis(pgClient, authService, safetyService, broker, redisClient, extensionZip)
 	router := server.SetupRouter()
 
 	httpServer := &http.Server{

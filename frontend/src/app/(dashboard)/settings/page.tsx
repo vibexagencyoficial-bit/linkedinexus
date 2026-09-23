@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import {
   ShieldCheck,
   ShieldAlert,
@@ -8,8 +9,6 @@ import {
   CheckCircle2,
   Linkedin,
   Puzzle,
-  RefreshCw,
-  Copy,
   Check,
   AlertCircle,
   ExternalLink,
@@ -21,7 +20,11 @@ export default function SettingsPage() {
   const [dailyLimit, setDailyLimit] = useState(30);
   const [allowedStart, setAllowedStart] = useState("08:00");
   const [allowedEnd, setAllowedEnd] = useState("18:00");
+  const [serverMaxLimit, setServerMaxLimit] = useState(50);
+  const [serverMinLimit, setServerMinLimit] = useState(5);
+  const [isSavingLimits, setIsSavingLimits] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [limitsError, setLimitsError] = useState<string | null>(null);
 
   // LinkedIn Account state
   const [account, setAccount] = useState<LinkedInAccount | null>(null);
@@ -29,55 +32,74 @@ export default function SettingsPage() {
   const [liProfileName, setLiProfileName] = useState("Lucas (LinkedIn)");
   const [liSessionKey, setLiSessionKey] = useState("");
   const [showLiModal, setShowLiModal] = useState(false);
+  // Erros reais da API (A1: contrato honesto — nunca fabricar sucesso)
+  const [accountError, setAccountError] = useState<string | null>(null);
+  const [extError, setExtError] = useState<string | null>(null);
 
-  // Extension state
+  // Extension status (resumo — gerenciamento completo fica em /extension)
   const [extStatus, setExtStatus] = useState<ExtensionStatus | null>(null);
-  const [pairingCode, setPairingCode] = useState<string | null>(null);
-  const [pairingExpiry, setPairingExpiry] = useState<string | null>(null);
-  const [isGeneratingPairing, setIsGeneratingPairing] = useState(false);
-  const [copiedCode, setCopiedCode] = useState(false);
 
-  const serverMaxLimit = 50;
-  const effectiveLimit = Math.min(dailyLimit, serverMaxLimit);
+  const effectiveLimit = Math.min(Math.max(dailyLimit, serverMinLimit), serverMaxLimit);
 
   const loadData = async () => {
+    // A1 (contrato honesto): cada fonte registra seu erro real; nada é fabricado.
+    const accRes = await api.getCurrentAccount().catch((err: unknown) => {
+      setAccountError(err instanceof Error ? err.message : String(err));
+      return null;
+    });
+    const extRes = await api.getExtensionStatus().catch((err: unknown) => {
+      setExtError(err instanceof Error ? err.message : String(err));
+      return null;
+    });
+    if (accRes) {
+      setAccount(accRes);
+      setAccountError(null);
+    } else {
+      setAccount(null);
+    }
+    if (extRes) {
+      setExtStatus(extRes);
+      setExtError(null);
+    } else {
+      setExtStatus(null);
+    }
+  };
+
+  // Limites vêm do backend (organizations.platform_settings; F1) — sem valor
+  // cosmético local: o que aparece é o que está persistido.
+  const loadLimits = async () => {
     try {
-      const [accRes, extRes] = await Promise.all([
-        api.getCurrentAccount().catch(() => null),
-        api.getExtensionStatus().catch(() => null),
-      ]);
-      if (accRes) setAccount(accRes);
-      if (extRes) setExtStatus(extRes);
-    } catch {
-      // Graceful fallback
+      const limits = await api.getDailyLimits();
+      setDailyLimit(limits.daily_limit);
+      setAllowedStart(limits.allowed_start_time);
+      setAllowedEnd(limits.allowed_end_time);
+      setServerMaxLimit(limits.server_max_limit);
+      setServerMinLimit(limits.server_min_limit);
+      setLimitsError(null);
+    } catch (err: unknown) {
+      setLimitsError(err instanceof Error ? err.message : String(err));
     }
   };
 
   useEffect(() => {
     loadData();
+    loadLimits();
     const interval = setInterval(loadData, 3000);
     return () => clearInterval(interval);
   }, []);
 
   const handleQuickConnectLinkedIn = async () => {
     setIsConnectingLi(true);
+    setAccountError(null);
     try {
       await api.connectAccount({
         display_name: "Lucas (LinkedIn Profile)",
       });
       await loadData();
-    } catch {
-      setAccount({
-        connected: true,
-        connection_status: "connected",
-        display_name: "Lucas (LinkedIn Profile)",
-        daily_limit: 40,
-        capabilities: {
-          profile_read: true,
-          connections_read: true,
-          messaging_available: true,
-        },
-      });
+    } catch (err: unknown) {
+      // A1: erro real chega à UI; badge permanece NOT CONNECTED.
+      setAccount(null);
+      setAccountError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsConnectingLi(false);
     }
@@ -86,6 +108,7 @@ export default function SettingsPage() {
   const handleConnectLinkedIn = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsConnectingLi(true);
+    setAccountError(null);
     try {
       await api.connectAccount({
         display_name: liProfileName,
@@ -93,20 +116,10 @@ export default function SettingsPage() {
       });
       setShowLiModal(false);
       await loadData();
-    } catch {
-      // Offline fallback
-      setAccount({
-        connected: true,
-        connection_status: "connected",
-        display_name: liProfileName,
-        daily_limit: 40,
-        capabilities: {
-          profile_read: true,
-          connections_read: true,
-          messaging_available: true,
-        },
-      });
-      setShowLiModal(false);
+    } catch (err: unknown) {
+      // A1: erro real chega à UI (modal permanece aberto); sem conta fictícia.
+      setAccount(null);
+      setAccountError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsConnectingLi(false);
     }
@@ -116,45 +129,39 @@ export default function SettingsPage() {
     try {
       await api.disconnectAccount();
       await loadData();
-    } catch {
-      setAccount(null);
+    } catch (err: unknown) {
+      setAccountError(err instanceof Error ? err.message : String(err));
     }
   };
 
-  const handleGeneratePairing = async () => {
-    setIsGeneratingPairing(true);
+  const handleSaveLimits = async () => {
+    setIsSavingLimits(true);
+    setLimitsError(null);
     try {
-      const res = await api.generatePairingCode();
-      setPairingCode(res.pairing_code);
-      setPairingExpiry(new Date(res.expires_at).toLocaleTimeString());
-    } catch {
-      // Demo code for local offline test
-      const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-      setPairingCode(code);
-      setPairingExpiry("10 minutos");
+      await api.saveDailyLimits({
+        daily_limit: effectiveLimit,
+        allowed_start_time: allowedStart,
+        allowed_end_time: allowedEnd,
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      await loadLimits();
+    } catch (err: unknown) {
+      // Sem API não há "Configurações Salvas": o erro real substitui o sucesso.
+      setSaved(false);
+      setLimitsError(err instanceof Error ? err.message : String(err));
     } finally {
-      setIsGeneratingPairing(false);
+      setIsSavingLimits(false);
     }
-  };
-
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedCode(true);
-    setTimeout(() => setCopiedCode(false), 2000);
-  };
-
-  const handleSaveLimits = () => {
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
   };
 
   return (
-    <div className="max-w-4xl space-y-6">
+    <div className="max-w-3xl mx-auto space-y-6">
       {/* Title */}
       <div>
         <h1 className="text-xl font-bold tracking-tight text-white">Configurações & Integrações</h1>
         <p className="text-xs text-zinc-400 mt-0.5">
-          Conecte sua conta do LinkedIn com segurança, sincronize a extensão WXT e defina os limites operacionais de cadência.
+          Conecte sua conta do LinkedIn, acompanhe a extensão e defina os limites operacionais de cadência.
         </p>
       </div>
 
@@ -222,6 +229,22 @@ export default function SettingsPage() {
           </div>
         </div>
 
+        {/* A1: erro real da conta (badge permanece NOT CONNECTED) */}
+        {accountError && !account?.connected && (
+          <div
+            role="alert"
+            className="rounded-lg border border-red-500/30 bg-red-950/20 p-3 text-xs text-red-300 flex items-start gap-2.5"
+          >
+            <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <span className="font-medium block">Falha ao conectar a conta LinkedIn</span>
+              <span className="text-[11px] text-red-300/80 font-mono break-all">
+                {accountError}
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* Connected account status details */}
         {account?.connected ? (
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
@@ -270,108 +293,47 @@ export default function SettingsPage() {
         )}
       </div>
 
-      {/* Integration Card: Browser Extension (Spec Section 10 & 11) */}
-      <div className="rounded-xl border border-zinc-800 bg-[#111215] p-5 space-y-4">
-        <div className="flex items-center justify-between pb-3 border-b border-zinc-800/80">
-          <div className="flex items-center space-x-3">
-            <div className="w-9 h-9 rounded-lg bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
-              <Puzzle className="w-5 h-5" />
-            </div>
-            <div>
-              <h2 className="text-sm font-semibold text-white">Extensão de Navegador (WXT MV3)</h2>
-              <p className="text-xs text-zinc-400">
-                Ponte autoritária para sincronização de conexões e execução segura de ações.
-              </p>
-            </div>
+      {/* Extensão: linha-resumo — página dedicada em /extension */}
+      <Link
+        href="/extension"
+        className="rounded-xl border border-zinc-800 bg-[#111215] p-4 flex items-center justify-between hover:border-zinc-700 transition group"
+      >
+        <div className="flex items-center space-x-3">
+          <div className="w-9 h-9 rounded-lg bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+            <Puzzle className="w-5 h-5" />
           </div>
-
-          <div className="flex items-center space-x-2">
-            <span
-              className={`text-xs px-2.5 py-0.5 rounded-full font-mono font-medium flex items-center gap-1.5 ${
-                extStatus?.connected
-                  ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                  : "bg-zinc-800 text-zinc-400 border border-zinc-700"
-              }`}
-            >
-              {extStatus?.connected ? (
-                <>
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                  <span>CONNECTED</span>
-                </>
-              ) : (
-                <span>OFFLINE</span>
-              )}
-            </span>
-            <button
-              onClick={handleGeneratePairing}
-              disabled={isGeneratingPairing}
-              className="px-3 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-white transition flex items-center gap-1.5"
-            >
-              <RefreshCw className={`w-3 h-3 ${isGeneratingPairing ? "animate-spin" : ""}`} />
-              <span>Gerar Código de Pareamento</span>
-            </button>
-          </div>
-        </div>
-
-        {extStatus?.connected ? (
-          <div className="rounded-lg border border-emerald-500/20 bg-emerald-950/10 p-3.5 flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-7 h-7 rounded-full bg-emerald-500/20 flex items-center justify-center text-emerald-400">
-                <Check className="w-4 h-4" />
-              </div>
-              <div>
-                <span className="text-xs font-semibold text-emerald-300 block">
-                  Extensão Ativa e Sincronizada
-                </span>
-                <span className="text-[11px] text-zinc-400 block mt-0.5">
-                  Dispositivo: {extStatus.device_name || "VibexCorp Chrome Extension"} · Heartbeat ativo em tempo real
-                </span>
-              </div>
-            </div>
-            <button
-              onClick={loadData}
-              className="px-2.5 py-1 rounded text-[11px] border border-zinc-700 hover:bg-zinc-800 text-zinc-300 transition"
-            >
-              Atualizar Status
-            </button>
-          </div>
-        ) : (
-          <div className="rounded-lg border border-zinc-800/60 bg-[#141518] p-3 text-xs text-zinc-400">
-            A extensão complementa o SaaS capturando conexões do LinkedIn e reportando heartbeat ao backend. Insira o código de pareamento no popup da extensão para ativar.
-          </div>
-        )}
-
-        {pairingCode ? (
-          <div className="rounded-lg border border-indigo-500/30 bg-indigo-950/20 p-4 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-indigo-300">
-                Código de Pareamento Único (Válido por {pairingExpiry}):
-              </span>
-              <button
-                onClick={() => copyToClipboard(pairingCode)}
-                className="flex items-center gap-1 text-xs text-zinc-300 hover:text-white px-2 py-0.5 rounded bg-zinc-800"
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-semibold text-white">Extensão de Navegador</h2>
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-medium flex items-center gap-1 ${
+                  extStatus?.connected
+                    ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                    : "bg-zinc-800 text-zinc-400 border border-zinc-700"
+                }`}
               >
-                {copiedCode ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                <span>{copiedCode ? "Copiado!" : "Copiar"}</span>
-              </button>
+                {extStatus?.connected ? (
+                  <>
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span>CONNECTED</span>
+                  </>
+                ) : (
+                  <span>OFFLINE</span>
+                )}
+              </span>
             </div>
-            <div className="text-xl font-mono font-bold tracking-widest text-white text-center py-2 bg-[#090a0c] rounded border border-zinc-800">
-              {pairingCode}
-            </div>
-            <p className="text-[11px] text-zinc-400">
-              Abra a extensão VibexCorp no Chrome e cole este código no campo de Pareamento para vincular o navegador à sua organização.
+            <p className="text-xs text-zinc-400 mt-0.5">
+              {extError && !extStatus?.connected
+                ? "Falha ao consultar o status — veja o erro na página da extensão."
+                : "Download, pareamento e instalação passo a passo."}
             </p>
           </div>
-        ) : (
-          <div className="text-xs text-zinc-400 flex items-center justify-between p-3 rounded-lg bg-[#141518] border border-zinc-800/60">
-            <span>
-              {extStatus?.connected
-                ? `Dispositivo conectado: ${extStatus.device_name || "Chrome Extension"} (Última atividade: ${new Date(extStatus.last_seen_at || "").toLocaleTimeString()})`
-                : "A extensão complementa o SaaS capturando conexões do LinkedIn e reportando heartbeat ao backend."}
-            </span>
-          </div>
-        )}
-      </div>
+        </div>
+        <span className="flex items-center gap-1.5 text-xs text-zinc-400 group-hover:text-white transition flex-shrink-0">
+          <span>Gerenciar</span>
+          <ExternalLink className="w-3.5 h-3.5" />
+        </span>
+      </Link>
 
       {/* Safety Policy & Limits Card (Spec Section 28 & 29) */}
       <div className="rounded-xl border border-zinc-800 bg-[#111215] p-5 space-y-5">
@@ -382,9 +344,23 @@ export default function SettingsPage() {
           </div>
           <div className="flex items-center gap-1.5 text-xs text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 font-mono">
             <ShieldCheck className="w-3 h-3" />
-            <span>Teto Backend: 50 msg/dia</span>
+            <span>Teto Backend: {serverMaxLimit} msg/dia</span>
           </div>
         </div>
+
+        {/* Erro real dos limites (carregar ou salvar): sem sucesso fabricado */}
+        {limitsError && (
+          <div
+            role="alert"
+            className="rounded-lg border border-red-500/30 bg-red-950/20 p-3 text-xs text-red-300 flex items-start gap-2.5"
+          >
+            <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <span className="font-medium block">Falha nos limites de envio</span>
+              <span className="text-[11px] text-red-300/80 font-mono break-all">{limitsError}</span>
+            </div>
+          </div>
+        )}
 
         <div className="space-y-4">
           <div>
@@ -394,16 +370,16 @@ export default function SettingsPage() {
             </div>
             <input
               type="range"
-              min="5"
-              max="70"
-              value={dailyLimit}
+              min={serverMinLimit}
+              max={serverMaxLimit}
+              value={Math.min(dailyLimit, serverMaxLimit)}
               onChange={(e) => setDailyLimit(parseInt(e.target.value))}
               className="w-full accent-indigo-500"
             />
             <div className="flex justify-between text-[11px] text-zinc-500 mt-1 font-mono">
-              <span>Mínimo: 5</span>
+              <span>Mínimo: {serverMinLimit}</span>
               <span className="text-emerald-400">Efetivo: {effectiveLimit}</span>
-              <span>Máximo do Servidor: 50</span>
+              <span>Máximo do Servidor: {serverMaxLimit}</span>
             </div>
           </div>
 
@@ -438,7 +414,8 @@ export default function SettingsPage() {
           <div className="flex justify-end pt-2">
             <button
               onClick={handleSaveLimits}
-              className="flex items-center space-x-1.5 px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white transition shadow-sm"
+              disabled={isSavingLimits}
+              className="flex items-center space-x-1.5 px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white transition shadow-sm disabled:opacity-60"
             >
               {saved ? (
                 <>
@@ -446,7 +423,7 @@ export default function SettingsPage() {
                   <span>Configurações Salvas</span>
                 </>
               ) : (
-                <span>Salvar Configurações</span>
+                <span>{isSavingLimits ? "Salvando..." : "Salvar Configurações"}</span>
               )}
             </button>
           </div>

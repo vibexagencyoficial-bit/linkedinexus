@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Search,
   Upload,
@@ -37,6 +37,40 @@ export default function ContactsPage() {
   // Quick Sync Form (Real LinkedIn Connections)
   const [syncBatchText, setSyncBatchText] = useState("");
   const [isSyncing, setIsSyncing] = useState(false);
+
+  // Upload de arquivo (CSV/JSON) — pipeline real: multipart → backend →
+  // dedupe → Postgres. Mensagem honesta de resultado/erro.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // permite re-selecionar o mesmo arquivo
+    if (!file) return;
+
+    const ext = file.name.toLowerCase().split(".").pop();
+    if (ext !== "csv" && ext !== "json") {
+      setImportMsg({ ok: false, text: "Formato não suportado — use .csv ou .json (veja scripts/list/normalize.mjs)." });
+      return;
+    }
+
+    setIsImporting(true);
+    setImportMsg(null);
+    try {
+      const res = await api.importContactsFile(file);
+      const n = res.inserted ?? res.imported ?? res.synced ?? 0;
+      setImportMsg({ ok: true, text: `✓ ${n} contatos importados de ${file.name}.` });
+      await loadContacts();
+    } catch (err: unknown) {
+      setImportMsg({
+        ok: false,
+        text: err instanceof Error ? err.message : `Falha ao importar ${file.name}.`,
+      });
+    } finally {
+      setIsImporting(false);
+    }
+  };
 
   const loadContacts = async () => {
     setIsLoading(true);
@@ -146,6 +180,26 @@ export default function ContactsPage() {
         </div>
 
         <div className="flex items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv,.json"
+            className="hidden"
+            onChange={handleImportFile}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isImporting}
+            className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-zinc-700 bg-zinc-800/60 text-xs font-medium text-zinc-200 hover:text-white hover:bg-zinc-800 transition disabled:opacity-60"
+          >
+            {isImporting ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Upload className="w-3.5 h-3.5" />
+            )}
+            <span>{isImporting ? "Importando..." : "Importar CSV/JSON"}</span>
+          </button>
+
           <button
             onClick={() => setShowSyncModal(true)}
             className="flex items-center space-x-1.5 px-3 py-1.5 rounded-md border border-[#0077b5]/30 bg-[#0077b5]/10 text-xs font-medium text-[#38bdf8] hover:bg-[#0077b5]/20 transition"
@@ -163,6 +217,26 @@ export default function ContactsPage() {
           </button>
         </div>
       </div>
+
+      {/* Resultado honesto do upload (imported/skipped ou erro real) */}
+      {importMsg && (
+        <div
+          role="status"
+          className={`px-3 py-2 rounded-lg border text-xs flex items-center justify-between ${
+            importMsg.ok
+              ? "border-emerald-500/30 bg-emerald-950/20 text-emerald-300"
+              : "border-red-500/30 bg-red-950/20 text-red-300"
+          }`}
+        >
+          <span className="font-mono break-all">{importMsg.text}</span>
+          <button
+            onClick={() => setImportMsg(null)}
+            className="ml-3 text-[10px] opacity-70 hover:opacity-100 flex-shrink-0"
+          >
+            fechar
+          </button>
+        </div>
+      )}
 
       {/* Filter and Search Bar */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-2.5 rounded-lg border border-zinc-800 bg-[#111215]">

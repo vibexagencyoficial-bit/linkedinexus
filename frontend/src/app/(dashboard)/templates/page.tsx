@@ -14,12 +14,13 @@ export default function TemplatesPage() {
   const [needsReview, setNeedsReview] = useState(false);
   const [missingVars, setMissingVars] = useState<string[]>([]);
 
-  // Test contact for variable testing
+  // Contato de exemplo editável para testar variáveis (Fase E: rotulado
+  // como exemplo — nunca é persistido nem exibido como contato real).
   const [testContact, setTestContact] = useState({
-    first_name: "Lucas",
-    full_name: "Lucas Silva",
-    company: "VibexCorp",
-    job_title: "Tech Lead",
+    first_name: "",
+    full_name: "",
+    company: "",
+    job_title: "",
   });
 
   const insertVariable = (varName: string) => {

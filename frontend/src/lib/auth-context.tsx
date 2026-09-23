@@ -1,7 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useState } from "react";
-import { useRouter, usePathname } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { api } from "./api";
 import { User } from "@vibexcorp/api-client";
 
@@ -20,10 +20,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const router = useRouter();
-  const pathname = usePathname();
 
   useEffect(() => {
-    // Check saved session
+    // Sessão salva real: só restaura token + usuário persistidos de um login
+    // válido. Sem sessão salva, NÃO existe sessão demo — o usuário segue
+    // deslogado e o middleware de rota o leva a /login (Fase D).
     const savedToken = localStorage.getItem("vibex_auth_token");
     const savedUser = localStorage.getItem("vibex_auth_user");
 
@@ -37,50 +38,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         localStorage.removeItem("vibex_auth_token");
         localStorage.removeItem("vibex_auth_user");
       }
-    } else if (pathname !== "/login") {
-      // Default initial session for ease of use in local development
-      const defaultUser: User = {
-        id: "a0000000-0000-0000-0000-000000000001",
-        organization_id: "00000000-0000-0000-0000-000000000001",
-        email: "admin@vibexcorp.com",
-        name: "Lucas (VibexCorp)",
-        role: "owner",
-      };
-      const demoToken = "demo_token_vibex_2026";
-      setUser(defaultUser);
-      setToken(demoToken);
-      api.setToken(demoToken);
-      localStorage.setItem("vibex_auth_token", demoToken);
-      localStorage.setItem("vibex_auth_user", JSON.stringify(defaultUser));
     }
     setIsLoading(false);
-  }, [pathname]);
+  }, []);
 
   const login = async (email: string, pass: string) => {
-    try {
-      const res = await api.login(email, pass);
-      setUser(res.user);
-      setToken(res.token);
-      localStorage.setItem("vibex_auth_token", res.token);
-      localStorage.setItem("vibex_auth_user", JSON.stringify(res.user));
-      router.push("/");
-    } catch {
-      // Fallback for seamless initial local testing if API isn't booted yet
-      const fallbackUser: User = {
-        id: "a0000000-0000-0000-0000-000000000001",
-        organization_id: "00000000-0000-0000-0000-000000000001",
-        email: email,
-        name: "Lucas (VibexCorp)",
-        role: "owner",
-      };
-      const token = "auth_tok_" + Date.now();
-      setUser(fallbackUser);
-      setToken(token);
-      api.setToken(token);
-      localStorage.setItem("vibex_auth_token", token);
-      localStorage.setItem("vibex_auth_user", JSON.stringify(fallbackUser));
-      router.push("/");
-    }
+    // Sem fallback: o erro real da API (401 AUTH_INVALID_CREDENTIALS, 503
+    // STORE_UNAVAILABLE) propaga para a página de login exibir. Criar sessão
+    // local aqui mascararia falha de auth como sucesso (Fase D).
+    const res = await api.login(email, pass);
+    setUser(res.user);
+    setToken(res.token);
+    localStorage.setItem("vibex_auth_token", res.token);
+    localStorage.setItem("vibex_auth_user", JSON.stringify(res.user));
+    router.push("/");
   };
 
   const logout = async () => {

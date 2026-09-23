@@ -43,3 +43,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Locais/gerados — nunca commitar
+.env.parsed
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+ext/vibexcorp-extension.zip

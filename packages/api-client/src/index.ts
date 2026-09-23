@@ -52,6 +52,40 @@ export interface ExtensionStatus {
   last_seen_at?: string;
 }
 
+// Dispatch real (worker → extensão): job enfileirado pelo backend com a
+// mensagem já renderizada para o contato.
+export interface PendingOutreachJob {
+  job_id: string;
+  contact_id: string;
+  first_name: string;
+  last_name: string;
+  full_name: string;
+  company: string;
+  job_title: string;
+  linkedin_url: string;
+  rendered_message: string;
+}
+
+// Parâmetros de comportamento humano (assist Typesafe/Jev ou fallback
+// determinístico — `source` e `assist_available` dizem quem guiou).
+export interface HumanizeParams {
+  assist_available: boolean;
+  source: 'typesafe' | 'fallback';
+  click_delay_ms: number;
+  type_cps_min: number;
+  type_cps_max: number;
+  pause_every_min_chars: number;
+  pause_every_max_chars: number;
+  pause_ms_min: number;
+  pause_ms_max: number;
+  mouse_steps_min: number;
+  mouse_steps_max: number;
+  scroll_dwell_ms: number;
+  suggested_selector?: string;
+  page_state?: string;
+  confidence?: number;
+}
+
 export interface Contact {
   id: string;
   first_name: string;
@@ -96,6 +130,8 @@ export interface CampaignInput {
   allowed_end_time?: string;
   timezone?: string;
   is_flow_custom?: boolean;
+  /** Contatos desta cadência; vazio = todos os contatos da organização. */
+  contact_ids?: string[];
 }
 
 export interface CampaignStep {
@@ -137,23 +173,50 @@ export interface TemplateRenderResult {
   error: string | null;
 }
 
-export interface PendingOutreachContact {
-  id: string;
-  first_name: string;
-  last_name: string;
-  full_name: string;
-  company: string;
-  job_title: string;
-  linkedin_url: string;
-  rendered_message: string;
-}
-
 export interface PendingOutreachResponse {
+  has_campaign: boolean;
   campaign_id: string;
   campaign_name: string;
-  template: string;
-  total_pending: number;
-  contacts: PendingOutreachContact[];
+  queue_remaining: number;
+  daily_remaining: number;
+  job: PendingOutreachJob | null;
+}
+
+/**
+ * Contrato honesto (PRD-honestidade-conexao, fases A2–D): códigos de erro
+ * que a API retorna e o openapi.yaml documenta. O request() abaixo propaga
+ * code+message para a UI exibir o erro real (nuncaFallback silencioso).
+ */
+export type HonestErrorCode =
+  | 'STORE_UNAVAILABLE'
+  | 'UNAUTHENTICATED'
+  | 'AUTH_INVALID_CREDENTIALS'
+  | 'AUTH_TOKEN_GENERATION_FAILED'
+  | 'AUTH_TOKEN_REFRESH_FAILED'
+  | 'INVALID_PAIRING_CODE'
+  | 'EVIDENCE_REQUIRED'
+  | 'CONTACT_NOT_FOUND'
+  | 'CAMPAIGN_NOT_FOUND'
+  | 'CONVERSATION_NOT_FOUND'
+  | 'INVALID_REQUEST'
+  | 'VALIDATION_FAILED'
+  | 'INVALID_CAMPAIGN_ID'
+  | 'INVALID_CONTACT_ID'
+  | 'INVALID_CONVERSATION_ID'
+  | 'FILE_REQUIRED'
+  | 'CSV_PARSE_FAILED';
+
+export class ApiError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly details?: unknown;
+  constructor(code: string, message: string, status: number, details?: unknown) {
+    super(`${code}: ${message}`);
+    this.name = 'ApiError';
+    this.code = code;
+    this.status = status;
+    this.details = details;
+  }
 }
 
 export interface ReportSentRequest {
@@ -162,6 +225,8 @@ export interface ReportSentRequest {
   message_body: string;
   linkedin_url?: string;
   status?: string;
+  job_id?: string;
+  error?: string;
 }
 
 export interface ConversationMessage {
@@ -215,8 +280,11 @@ export class VibexApiClient {
 
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      // Contrato honesto: propaga code + message + details para a UI exibir
+      // o erro real (A1/D); ApiError carrega o status HTTP (401/404/428/503).
+      const code = errBody?.error?.code || `HTTP_${res.status}`;
       const msg = errBody?.error?.message || errBody?.error || `HTTP ${res.status}: ${res.statusText}`;
-      throw new Error(msg);
+      throw new ApiError(code, msg, res.status, errBody?.error?.details);
     }
 
     return res.json() as Promise<T>;
@@ -314,6 +382,53 @@ export class VibexApiClient {
       body: JSON.stringify({ connections }),
     });
   }
+
+  // Upload real de arquivo (.csv multipart; .json vai como sync-linkedin).
+  async importContactsFile(file: File): Promise<{ inserted?: number; imported?: number; synced?: number; skipped?: number; status?: string }> {
+    if (file.name.toLowerCase().endsWith('.json')) {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as unknown;
+      const connections = Array.isArray(parsed) ? parsed : (parsed as { connections?: ContactInput[] }).connections ?? [];
+      return this.syncLinkedInContacts(connections as ContactInput[]);
+    }
+    // multipart: sem Content-Type fixa (o browser define o boundary).
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${this.baseUrl}/contacts/import`, {
+      method: 'POST',
+      headers: this.token ? { Authorization: `Bearer ${this.token}` } : undefined,
+      body: form,
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({ error: { message: res.statusText } }));
+      const code = errBody?.error?.code || `HTTP_${res.status}`;
+      const msg = errBody?.error?.message || `HTTP ${res.status}: ${res.statusText}`;
+      throw new ApiError(code, msg, res.status, errBody?.error?.details);
+    }
+    return res.json() as Promise<{ inserted?: number; imported?: number; skipped?: number; status?: string }>;
+  }
+
+  // --- Limites globais (settings reais) ---
+  async getDailyLimits(): Promise<{ daily_limit: number; allowed_start_time: string; allowed_end_time: string; timezone: string; server_max_limit: number; server_min_limit: number }> {
+    return this.request('/settings/daily-limits');
+  }
+
+  async saveDailyLimits(data: { daily_limit: number; allowed_start_time: string; allowed_end_time: string; timezone?: string }): Promise<{ status: string; daily_limit: number }> {
+    return this.request('/settings/daily-limits', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  // --- Dispatch (extensão consome via fetch direto; painel usa para diagnóstico) ---
+  async assistHumanize(data: { action: string; selectors?: string[]; page_fingerprint?: string; language?: string }): Promise<HumanizeParams> {
+    return this.request<HumanizeParams>('/assist/humanize', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  static readonly EXTENSION_DOWNLOAD_URL = '/downloads/extension.zip';
 
   // --- Campaigns ---
   async listCampaigns(): Promise<{ campaigns: Campaign[] }> {

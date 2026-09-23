@@ -89,8 +89,12 @@ O **VibexCorp LinkedIn Outreach** é uma solução corporativa B2B de alto desem
 │   │   ├── popup/         # Popup de status rápido e auth
 │   │   ├── sidepanel/     # Painel lateral interativo
 │   │   └── api/           # API Client compartilhado via OpenAPI
-└── docker-compose.yml     # Orquestração local (postgres, redis, api, worker, scheduler, frontend)
+├── scripts/
+│   └── local/               # Boot local SEM Docker (disco D): start.ps1, stop.ps1, status.ps1
+└── docker-compose.yml     # Legado (não usado no dev local — ver scripts/local + PRD-honestidade-conexao §4b)
 ```
+
+> **Dev local sem Docker (obrigatório):** todo estado vive no disco **D** (`D:\vibex`: pgdata:5433, redis:6380, logs, tmp, caches). Subir com `powershell -ExecutionPolicy Bypass -File scripts\local\start.ps1`, conferir com `status.ps1`, derrubar com `stop.ps1`. Detalhes em `docs/prd/PRD-honestidade-conexao.md` §4b. O `docker-compose.yml` é legado e não deve ser usado.
 
 ---
 
@@ -103,3 +107,4 @@ Nenhuma tarefa é considerada finalizada sem:
 4. Teste crítico de idempotência: reenfileirar 10x o mesmo job deve persistir exatamente 1 envio.
 5. Teste de Stop on Reply: detecção de reply antes da execução deve cancelar o step seguinte.
 6. Registro detalhado no arquivo ativo de `memory/001_registro_continuo_memoria.md`.
+7. **Ritual de governança obrigatório (Regra 09 — `.agents/rules/09_PRD_E_GOVERNANCA.md`):** toda feature, correção, refactor ou migração não-trivial exige, ANTES de codar, um PRD em `docs/prd/PRD-<slug>.md` + declaração de impacto nas rules 01–08 + atualização do `api/openapi.yaml` se a API mudar + registro de intenção no `memory/` ativo (+ `/graphify` quando a skill estiver instalada); e DEPOIS de implementar, apensar decisões/testes/DoD ao `memory/`, atualizar as rules com precedente novo e marcar o status no PRD. Sem esses itens, a tarefa NÃO está concluída.

@@ -1,41 +1,36 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vibexcorp/linkedin-outreach/backend/internal/auth"
 	"github.com/vibexcorp/linkedin-outreach/backend/internal/events"
 	"github.com/vibexcorp/linkedin-outreach/backend/internal/messaging"
+	"github.com/vibexcorp/linkedin-outreach/backend/internal/ratelimit"
 	"github.com/vibexcorp/linkedin-outreach/backend/internal/safety"
 	"github.com/vibexcorp/linkedin-outreach/backend/internal/templates"
 	"github.com/vibexcorp/linkedin-outreach/backend/platform/postgres"
+	redisplatform "github.com/vibexcorp/linkedin-outreach/backend/platform/redis"
 	"github.com/vibexcorp/linkedin-outreach/backend/platform/telemetry"
 )
 
-type inMemoryStore struct {
-	mu           sync.RWMutex
-	pairingCodes map[string]time.Time
-	devices      map[string]time.Time
-	account      map[string]any
-	contacts     []map[string]any
-	campaigns    []map[string]any
-	steps        map[string][]map[string]any
-	activity     []map[string]any
-	conversations []map[string]any
-}
+// Fase E: sem store em memória — todo estado vive no Postgres sob RLS.
+// Nenhum handler fabrica dado local; sem store a resposta é 503 honesto.
 
 type Server struct {
 	pgClient      *postgres.Client
@@ -44,7 +39,10 @@ type Server struct {
 	broker        *events.Broker
 	renderer      *templates.Renderer
 	provider      messaging.MessagingProvider
-	inMemory      *inMemoryStore
+	rateLimiter   *ratelimit.RateLimiter
+	extensionZip  string // caminho do zip servido em /downloads/extension.zip
+	assist        *AssistService
+	workerStop    chan struct{}
 }
 
 func NewServer(
@@ -53,6 +51,24 @@ func NewServer(
 	safetyService *safety.PlatformSafetyService,
 	broker *events.Broker,
 ) *Server {
+	return NewServerWithRedis(pgClient, authService, safetyService, broker, nil, "")
+}
+
+// NewServerWithRedis permite injetar o rate limiter Redis (fila de dispacho
+// diário) e o caminho do zip da extensão. redisClient nil = limites em modo
+// degradado (worker aplica só cooldown local por contato).
+func NewServerWithRedis(
+	pgClient *postgres.Client,
+	authService *auth.Service,
+	safetyService *safety.PlatformSafetyService,
+	broker *events.Broker,
+	redisClient *redisplatform.Client,
+	extensionZipPath string,
+) *Server {
+	var rl *ratelimit.RateLimiter
+	if redisClient != nil {
+		rl = ratelimit.NewRateLimiter(redisClient)
+	}
 	srv := &Server{
 		pgClient:      pgClient,
 		authService:   authService,
@@ -60,20 +76,10 @@ func NewServer(
 		broker:        broker,
 		renderer:      templates.NewRenderer(),
 		provider:      messaging.NewLinkedInProvider("https://api.linkedin.com"),
-		inMemory: &inMemoryStore{
-			pairingCodes: make(map[string]time.Time),
-			devices:      map[string]time.Time{"current": time.Now()},
-			account: map[string]any{
-				"connected":         false,
-				"connection_status": "disconnected",
-				"daily_limit":       40,
-			},
-			contacts:      make([]map[string]any, 0),
-			campaigns:     make([]map[string]any, 0),
-			steps:         make(map[string][]map[string]any),
-			activity:      make([]map[string]any, 0),
-			conversations: make([]map[string]any, 0),
-		},
+		rateLimiter:   rl,
+		extensionZip:  extensionZipPath,
+		assist:        NewAssistServiceFromEnv(),
+		workerStop:    make(chan struct{}),
 	}
 	srv.startOutreachWorker()
 	return srv
@@ -128,30 +134,45 @@ func (s *Server) HandleLogin(w http.ResponseWriter, r *http.Request) {
 
 	var userID, orgID uuid.UUID
 	var passHash, name, role string
-	var found bool
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		err := s.pgClient.Pool.QueryRow(r.Context(), `
-			SELECT id, organization_id, password_hash, name, role
-			FROM users
-			WHERE LOWER(email) = $1
-		`, email).Scan(&userID, &orgID, &passHash, &name, &role)
-
-		if err == nil {
-			found = true
-		}
+	if s.pgClient == nil || s.pgClient.Pool == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "postgres offline - rode scripts/local/start.ps1", nil)
+		return
 	}
 
-	if !found {
-		// Default tenant and user bootstrap for immediate development and extension pairing
-		userID = uuid.MustParse("a0000000-0000-0000-0000-000000000001")
-		orgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
-		name = "Lucas (VibexCorp)"
-		role = "owner"
-		passHash, _ = auth.HashPassword("admin123")
+	// Lookup pre-tenant: o RLS de users isola por organizacao, mas no login a org
+	// ainda e desconhecida. A policy users_login_lookup (migration 000006) libera
+	// o SELECT apenas com o modo setado transacionalmente (nunca vaza para a
+	// conexao poolada).
+	tx, err := s.pgClient.Pool.Begin(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to open store transaction", nil)
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	if _, err := tx.Exec(r.Context(), `SELECT set_config('app.login_lookup', 'on', true)`); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to set login lookup mode", nil)
+		return
 	}
 
-	if passHash != "" && !auth.CheckPassword(req.Password, passHash) && req.Password != "admin123" {
+	err = tx.QueryRow(r.Context(), `
+		SELECT id, organization_id, password_hash, name, role
+		FROM users
+		WHERE LOWER(email) = $1
+	`, email).Scan(&userID, &orgID, &passHash, &name, &role)
+
+	if err != nil {
+		writeAPIError(w, http.StatusUnauthorized, "AUTH_INVALID_CREDENTIALS", "invalid email or password", nil)
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to finish login lookup", nil)
+		return
+	}
+
+	if !auth.CheckPassword(req.Password, passHash) {
 		writeAPIError(w, http.StatusUnauthorized, "AUTH_INVALID_CREDENTIALS", "invalid email or password", nil)
 		return
 	}
@@ -212,6 +233,66 @@ func (s *Server) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": newToken})
 }
 
+// --- B2: tenant context helper (PRD-honestidade-conexao, Fase B2) ---//
+// Todo acesso ao Postgres passa por este helper: sem JWT com orgID válido o
+// handler retorna 401 UNAUTHENTICATED (sem fallback para a org default), e a
+// query roda numa transação com SET LOCAL app.organization_id via
+// ExecWithTenant — nunca na conexão poolada, onde o estado vazaria.
+
+// requireTenant extrai o orgID dos claims do middleware. Handlers protegidos
+// sempre rodam atrás de auth.Middleware; claims ausentes ou sem orgID são
+// rejeitados de forma honesta em vez de assumirem a organização default.
+func requireTenant(r *http.Request) (uuid.UUID, uuid.UUID, bool) {
+	claims, ok := auth.GetClaims(r.Context())
+	if !ok || claims == nil || claims.OrganizationID == uuid.Nil {
+		return uuid.Nil, uuid.Nil, false
+	}
+	return claims.OrganizationID, claims.UserID, true
+}
+
+// tenantOr401 responde 401 UNAUTHENTICATED quando não há tenant resolvido.
+func tenantOr401(w http.ResponseWriter, r *http.Request) (uuid.UUID, uuid.UUID, bool) {
+	orgID, userID, ok := requireTenant(r)
+	if !ok {
+		writeAPIError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "valid session with organization required", nil)
+		return uuid.Nil, uuid.Nil, false
+	}
+	return orgID, userID, true
+}
+
+// errCampaignNotOwned sinaliza campanha inexistente ou de outro tenant
+// dentro da transação (o handler converte em 404 CAMPAIGN_NOT_FOUND).
+var errCampaignNotOwned = errors.New("campaign not owned by tenant")
+
+// errContactNotFound sinaliza contato inexistente ou de outro tenant
+// dentro da transação (o handler converte em 404 CONTACT_NOT_FOUND).
+var errContactNotFound = errors.New("contact not owned by tenant")
+
+// tenantTxErr guarda o erro da última transação com tenant para que o
+// handler distinga "não pertence ao tenant" (404) de falha real (503).
+var tenantTxErr error
+
+// withTenantDB abre a transação com contexto de tenant e executa fn.
+// Sem store retorna 503 STORE_UNAVAILABLE honesto (A2); qualquer erro de
+// abertura/contexto/commit também é 503 — nunca dado fictício com 200.
+func (s *Server) withTenantDB(w http.ResponseWriter, r *http.Request, orgID uuid.UUID, fn func(tx pgx.Tx) error) bool {
+	if s.pgClient == nil || s.pgClient.Pool == nil {
+		tenantTxErr = nil
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "postgres offline - rode scripts/local/start.ps1", nil)
+		return false
+	}
+	if err := s.pgClient.ExecWithTenant(r.Context(), orgID, fn); err != nil {
+		tenantTxErr = err
+		if errors.Is(err, errCampaignNotOwned) || errors.Is(err, errContactNotFound) || errors.Is(err, errEvidenceRequired) {
+			return false // handler decide o 404/428; nada respondido aqui
+		}
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "database transaction failed", map[string]any{"detail": err.Error()})
+		return false
+	}
+	tenantTxErr = nil
+	return true
+}
+
 // --- LinkedIn Account & Capabilities (Section 7, 8, 9) ---
 
 type ConnectAccountRequest struct {
@@ -221,70 +302,79 @@ type ConnectAccountRequest struct {
 }
 
 func (s *Server) HandleCurrentAccount(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		var id uuid.UUID
-		var name, status, cbState string
-		var dailyLimit int
-		var lastSeen *time.Time
+	var (
+		id                                 uuid.UUID
+		name, status, cbState              string
+		dailyLimit                         int
+		lastSeen                           *time.Time
+		profileRead, connRead, msgAvail    bool
+		found                              bool
+	)
 
-		err := s.pgClient.Pool.QueryRow(r.Context(), `
+	// Conta nunca conectada = disconnected honesto (200), não 503:
+	// ErrNoRows é absorvido no callback, qualquer outro erro aborta em 503.
+	storeOK := s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(r.Context(), `
 			SELECT id, display_name, connection_status, circuit_breaker_state, daily_limit, last_seen_at
 			FROM linkedin_accounts
 			WHERE organization_id = $1
 			ORDER BY updated_at DESC
 			LIMIT 1
-		`, orgID).Scan(&id, &name, &status, &cbState, &dailyLimit, &lastSeen)
-
-		if err == nil {
-			var profileRead, connRead, msgAvailable bool
-			_ = s.pgClient.Pool.QueryRow(r.Context(), `
-				SELECT profile_read, connections_read, messaging_available
-				FROM linkedin_account_capabilities
-				WHERE linkedin_account_id = $1
-			`, id).Scan(&profileRead, &connRead, &msgAvailable)
-
-			writeJSON(w, http.StatusOK, map[string]any{
-				"connected":             status == "connected",
-				"id":                    id,
-				"display_name":          name,
-				"connection_status":     status,
-				"circuit_breaker_state": cbState,
-				"daily_limit":           dailyLimit,
-				"last_seen_at":          lastSeen,
-				"capabilities": map[string]bool{
-					"profile_read":        profileRead,
-					"connections_read":    connRead,
-					"messaging_available": msgAvailable,
-				},
-			})
-			return
+		`, orgID).Scan(&id, &name, &status, &cbState, &dailyLimit, &lastSeen); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
 		}
+
+		if err := tx.QueryRow(r.Context(), `
+			SELECT profile_read, connections_read, messaging_available
+			FROM linkedin_account_capabilities
+			WHERE linkedin_account_id = $1
+		`, id).Scan(&profileRead, &connRead, &msgAvail); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				found = true
+				return nil
+			}
+			return err
+		}
+
+		found = true
+		return nil
+	})
+	if !storeOK {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.RLock()
-	acc := s.inMemory.account
-	s.inMemory.mu.RUnlock()
-
-	writeJSON(w, http.StatusOK, acc)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"connected":             found && status == "connected",
+		"id":                    id,
+		"display_name":          name,
+		"connection_status":     status,
+		"circuit_breaker_state": cbState,
+		"daily_limit":           dailyLimit,
+		"last_seen_at":          lastSeen,
+		"capabilities": map[string]bool{
+			"profile_read":        profileRead,
+			"connections_read":    connRead,
+			"messaging_available": msgAvail,
+		},
+	})
 }
 
+// errEvidenceRequired sinaliza connect sem evidência de sessão verificável
+// dentro da transação (o handler converte em 428 EVIDENCE_REQUIRED).
+var errEvidenceRequired = errors.New("connect without verifiable session evidence")
+
 func (s *Server) HandleConnectAccount(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	userID := uuid.MustParse("a0000000-0000-0000-0000-000000000001")
-	if claims != nil {
-		if claims.OrganizationID != uuid.Nil {
-			orgID = claims.OrganizationID
-		}
-		if claims.UserID != uuid.Nil {
-			userID = claims.UserID
-		}
+	orgID, userID, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
 	var req ConnectAccountRequest
@@ -299,40 +389,52 @@ func (s *Server) HandleConnectAccount(w http.ResponseWriter, r *http.Request) {
 
 	accountID := uuid.New()
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_ = s.pgClient.Pool.QueryRow(r.Context(), `
+	// Connect exige evidência verificável (PRD-honestidade-conexao, Fase C):
+	// device active do tenant com heartbeat recente (<=2min) OU session_key
+	// não-vazia (credencial de sessão verificável enviada pelo frontend).
+	// Sem evidência → 428 EVIDENCE_REQUIRED honesto, nunca connected fictício.
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		if strings.TrimSpace(req.SessionKey) == "" {
+			var recent int
+			if err := tx.QueryRow(r.Context(), `
+				SELECT COUNT(*) FROM extension_devices
+				WHERE organization_id = $1 AND status = 'active'
+				  AND last_seen_at > NOW() - INTERVAL '2 minutes'
+			`, orgID).Scan(&recent); err != nil {
+				return err
+			}
+			if recent == 0 {
+				return errEvidenceRequired
+			}
+		}
+
+		if err := tx.QueryRow(r.Context(), `
 			INSERT INTO linkedin_accounts (
 				organization_id, user_id, display_name, connection_status, daily_limit, last_seen_at
 			) VALUES ($1, $2, $3, 'connected', 40, NOW())
 			RETURNING id
-		`, orgID, userID, req.DisplayName).Scan(&accountID)
+		`, orgID, userID, req.DisplayName).Scan(&accountID); err != nil {
+			return err
+		}
 
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
+		_, err := tx.Exec(r.Context(), `
 			INSERT INTO linkedin_account_capabilities (
 				organization_id, linkedin_account_id, profile_read, connections_read, messaging_available
 			) VALUES ($1, $2, true, true, true)
 			ON CONFLICT (linkedin_account_id) DO UPDATE SET
 				profile_read = true, connections_read = true, messaging_available = true, updated_at = NOW()
 		`, orgID, accountID)
+		return err
+	}) {
+		if errors.Is(tenantTxErr, errEvidenceRequired) {
+			writeAPIError(w, 428, "EVIDENCE_REQUIRED", "connect a extensão primeiro: nenhum device ativo com heartbeat recente e nenhuma session_key enviada", nil)
+			return
+		}
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.Lock()
-	s.inMemory.account = map[string]any{
-		"connected":             true,
-		"id":                    accountID,
-		"display_name":          req.DisplayName,
-		"connection_status":     "connected",
-		"circuit_breaker_state": "closed",
-		"daily_limit":           40,
-		"last_seen_at":          time.Now(),
-		"capabilities": map[string]bool{
-			"profile_read":        true,
-			"connections_read":    true,
-			"messaging_available": true,
-		},
-	}
-	s.inMemory.mu.Unlock()
-
+	// Sem espelho em memória: a conta conectada vive no Postgres sob RLS
+	// (CurrentAccount/ExtensionStatus leem de lá). Sem store → 503 acima.
 	s.broker.Publish(orgID, "integration.updated", map[string]any{
 		"account_id": accountID,
 		"status":     "connected",
@@ -346,50 +448,50 @@ func (s *Server) HandleConnectAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleDisconnectAccount(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(r.Context(), `
 			UPDATE linkedin_accounts
 			SET connection_status = 'disconnected', updated_at = NOW()
 			WHERE organization_id = $1
 		`, orgID)
+		return err
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.Lock()
-	s.inMemory.account["connected"] = false
-	s.inMemory.account["connection_status"] = "disconnected"
-	s.inMemory.mu.Unlock()
-
-	s.broker.Publish(orgID, "integration.updated", map[string]any{"status": "disconnected"})
+	s.broker.Publish(orgID, "integration.updated", map[string]string{"status": "disconnected"})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "disconnected"})
 }
 
 // --- Browser Extension Pairing & Heartbeat (Section 10, 11) ---
 
 func (s *Server) HandleGeneratePairingCode(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, userID, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 
 	bytes := make([]byte, 4)
 	_, _ = rand.Read(bytes)
 	code := strings.ToUpper(hex.EncodeToString(bytes))
 	expiresAt := time.Now().Add(10 * time.Minute)
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
+	// INSERT sujeito a RLS: exige o contexto do tenant dentro da transacao.
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(r.Context(), `
 			INSERT INTO extension_devices (
 				organization_id, user_id, device_name, pairing_code, pairing_expires_at, token_hash, status
 			) VALUES ($1, $2, 'Chrome Extension (Pending)', $3, $4, '', 'pairing')
-		`, claims.OrganizationID, claims.UserID, code, expiresAt)
+		`, orgID, userID, code, expiresAt)
+		return err
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
-
-	s.inMemory.mu.Lock()
-	s.inMemory.pairingCodes[code] = expiresAt
-	s.inMemory.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"pairing_code": code,
@@ -415,6 +517,11 @@ func (s *Server) HandlePairExtension(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.pgClient == nil || s.pgClient.Pool == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "postgres offline - rode scripts/local/start.ps1", nil)
+		return
+	}
+
 	// Generate high-entropy extension token
 	tokenBytes := make([]byte, 32)
 	_, _ = rand.Read(tokenBytes)
@@ -422,66 +529,144 @@ func (s *Server) HandlePairExtension(w http.ResponseWriter, r *http.Request) {
 	hash := sha256.Sum256([]byte(rawToken))
 	tokenHash := hex.EncodeToString(hash[:])
 
-	deviceID := uuid.New()
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	// Pareamento pre-tenant: a extensao nao tem JWT; o codigo efemero e a credencial.
+	// A policy extension_devices_pairing (migration 000007) libera o SELECT/UPDATE
+	// apenas com o modo setado transacionalmente.
+	tx, err := s.pgClient.Pool.Begin(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to open store transaction", nil)
+		return
+	}
+	defer tx.Rollback(r.Context())
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		var existingDeviceID, dbOrgID, dbUserID uuid.UUID
-		err := s.pgClient.Pool.QueryRow(r.Context(), `
-			SELECT id, organization_id, user_id
-			FROM extension_devices
-			WHERE pairing_code = $1 AND pairing_expires_at > NOW() AND status = 'pairing'
-			LIMIT 1
-		`, code).Scan(&existingDeviceID, &dbOrgID, &dbUserID)
-
-		if err == nil {
-			deviceID = existingDeviceID
-			orgID = dbOrgID
-			_, _ = s.pgClient.Pool.Exec(r.Context(), `
-				UPDATE extension_devices
-				SET device_name = $1, token_hash = $2, status = 'active', pairing_code = NULL, last_seen_at = NOW()
-				WHERE id = $3
-			`, "VibexCorp Chrome Extension MV3", tokenHash, deviceID)
-		}
+	if _, err := tx.Exec(r.Context(), `SELECT set_config('app.pairing_lookup', 'on', true)`); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to set pairing lookup mode", nil)
+		return
 	}
 
-	// Register device in memory store to guarantee immediate online status
-	s.inMemory.mu.Lock()
-	s.inMemory.devices[deviceID.String()] = time.Now()
-	s.inMemory.devices["current"] = time.Now()
-	s.inMemory.mu.Unlock()
+	var deviceID, orgID, dbUserID uuid.UUID
+	err = tx.QueryRow(r.Context(), `
+		SELECT id, organization_id, user_id
+		FROM extension_devices
+		WHERE pairing_code = $1 AND pairing_expires_at > NOW() AND status = 'pairing'
+		LIMIT 1
+	`, code).Scan(&deviceID, &orgID, &dbUserID)
+
+	if err != nil {
+		// Codigo inexistente, expirado ou ja consumido: nada de token ficticio.
+		writeAPIError(w, http.StatusNotFound, "INVALID_PAIRING_CODE", "pairing code invalid or expired", nil)
+		return
+	}
+
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE extension_devices
+		SET device_name = $1, token_hash = $2, status = 'active', pairing_code = NULL, last_seen_at = NOW()
+		WHERE id = $3
+	`, "VibexCorp Chrome Extension MV3", tokenHash, deviceID); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to persist device pairing", nil)
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to finish pairing", nil)
+		return
+	}
 
 	s.broker.Publish(orgID, "extension.paired", map[string]any{"device_id": deviceID})
+
+	// Pipeline real: a extensão também recebe um JWT assinado (mesmo secret,
+	// mesmo tenant/usuário do device pareado) para consumir /messaging/* e
+	// /assist/* — o extension_token continua sendo a credencial do heartbeat
+	// (resolve por token_hash na policy 000008).
+	apiJWT := ""
+	if s.pgClient != nil && s.pgClient.Pool != nil {
+		_ = s.pgClient.ExecWithTenant(r.Context(), orgID, func(tx pgx.Tx) error {
+			var email, role string
+			if err := tx.QueryRow(r.Context(), `
+				SELECT email, role FROM users WHERE id = $1
+			`, dbUserID).Scan(&email, &role); err != nil {
+				return err
+			}
+			token, err := s.authService.GenerateToken(dbUserID, orgID, email, role)
+			if err != nil {
+				return err
+			}
+			apiJWT = token
+			return nil
+		})
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"device_id":       deviceID,
 		"organization_id": orgID,
 		"extension_token": rawToken,
+		"api_jwt":         apiJWT,
 		"status":          "active",
 	})
 }
 
 func (s *Server) HandleExtensionHeartbeat(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	if s.pgClient == nil || s.pgClient.Pool == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "postgres offline - rode scripts/local/start.ps1", nil)
+		return
+	}
+
+	// O token da extensao (64 hex) nao carrega claims confiaveis: o dispositivo e
+	// resolvido pelo hash do token no banco (par token_hash -> device criado no
+	// pareamento). Sem device ativo correspondente, o heartbeat e rejeitado.
+	authHeader := r.Header.Get("Authorization")
+	parts := strings.SplitN(authHeader, " ", 2)
+	rawToken := ""
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		rawToken = strings.TrimSpace(parts[1])
+	}
+	if rawToken == "" {
+		writeAPIError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "extension token required", nil)
+		return
+	}
+	tokenHashBytes := sha256.Sum256([]byte(rawToken))
+	tokenHash := hex.EncodeToString(tokenHashBytes[:])
+
+	tx, err := s.pgClient.Pool.Begin(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to open store transaction", nil)
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	if _, err := tx.Exec(r.Context(), `SELECT set_config('app.device_lookup', 'on', true)`); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to set device lookup mode", nil)
+		return
+	}
+
+	var deviceID, orgID uuid.UUID
+	if err := tx.QueryRow(r.Context(), `
+		SELECT id, organization_id
+		FROM extension_devices
+		WHERE token_hash = $1 AND status = 'active'
+		LIMIT 1
+	`, tokenHash).Scan(&deviceID, &orgID); err != nil {
+		writeAPIError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "unknown or inactive device", nil)
+		return
 	}
 
 	now := time.Now()
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
-			UPDATE extension_devices
-			SET last_seen_at = NOW(), status = 'active'
-			WHERE organization_id = $1
-		`, orgID)
+	if _, err := tx.Exec(r.Context(), `
+		UPDATE extension_devices
+		SET last_seen_at = NOW()
+		WHERE id = $1
+	`, deviceID); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to persist heartbeat", nil)
+		return
 	}
 
-	s.inMemory.mu.Lock()
-	s.inMemory.devices["current"] = now
-	s.inMemory.devices["active"] = now
-	s.inMemory.mu.Unlock()
+	if err := tx.Commit(r.Context()); err != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "failed to finish heartbeat", nil)
+		return
+	}
 
+	// Sem espelho em memória: last_seen_at persiste em extension_devices e
+	// ExtensionStatus lê de lá. Sem store → 503 acima.
 	s.broker.Publish(orgID, "extension.heartbeat", map[string]any{"last_seen_at": now})
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -491,44 +676,47 @@ func (s *Server) HandleExtensionHeartbeat(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) HandleExtensionStatus(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
-	var lastSeen time.Time
-	var deviceName, status string
-	var found bool
+	var (
+		lastSeen          time.Time
+		deviceName        string
+		haveDevice        bool
+	)
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		err := s.pgClient.Pool.QueryRow(r.Context(), `
-			SELECT device_name, status, last_seen_at
+	// Sem device ativo do tenant (0 linhas sob RLS) = OFFLINE honesto (200);
+	// ErrNoRows absorvido no callback, demais erros abortam em 503.
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		err := tx.QueryRow(r.Context(), `
+			SELECT device_name, last_seen_at
 			FROM extension_devices
-			WHERE organization_id = $1 AND (status = 'active' OR status = 'connected')
+			WHERE organization_id = $1 AND status = 'active'
 			ORDER BY last_seen_at DESC
 			LIMIT 1
-		`, orgID).Scan(&deviceName, &status, &lastSeen)
-		if err == nil {
-			found = true
+		`, orgID).Scan(&deviceName, &lastSeen)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
 		}
+		haveDevice = true
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	if !found || lastSeen.IsZero() {
-		s.inMemory.mu.RLock()
-		if cur, ok := s.inMemory.devices["current"]; ok {
-			lastSeen = cur
-			found = true
-		} else if cur, ok := s.inMemory.devices["active"]; ok {
-			lastSeen = cur
-			found = true
-		}
-		s.inMemory.mu.RUnlock()
-		deviceName = "VibexCorp Chrome Extension MV3"
-	}
+	// connected significa exclusivamente: dispositivo active com heartbeat recente.
+	isOnline := haveDevice && !lastSeen.IsZero() && time.Since(lastSeen) < 2*time.Minute
 
-	isOnline := found && (!lastSeen.IsZero() && time.Since(lastSeen) < 10*time.Minute)
 	currentStatus := "OFFLINE"
+	deviceNameOut := ""
+	if haveDevice {
+		deviceNameOut = deviceName
+	}
 	if isOnline {
 		currentStatus = "CONNECTED"
 	}
@@ -536,7 +724,7 @@ func (s *Server) HandleExtensionStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":       currentStatus,
 		"connected":    isOnline,
-		"device_name":  deviceName,
+		"device_name":  deviceNameOut,
 		"last_seen_at": lastSeen,
 	})
 }
@@ -554,7 +742,10 @@ type ContactInput struct {
 }
 
 func (s *Server) HandleCreateContact(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 	var in ContactInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body", nil)
@@ -570,10 +761,10 @@ func (s *Server) HandleCreateContact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contactID := uuid.New()
+	metaJSON, _ := json.Marshal(in.Metadata)
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		metaJSON, _ := json.Marshal(in.Metadata)
-		_ = s.pgClient.Pool.QueryRow(r.Context(), `
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		return tx.QueryRow(r.Context(), `
 			INSERT INTO contacts (
 				organization_id, first_name, last_name, full_name, company, job_title, linkedin_url, metadata
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -586,24 +777,12 @@ func (s *Server) HandleCreateContact(w http.ResponseWriter, r *http.Request) {
 				metadata = EXCLUDED.metadata,
 				updated_at = NOW()
 			RETURNING id
-		`, claims.OrganizationID, in.FirstName, in.LastName, in.FullName, in.Company, in.JobTitle, in.LinkedInURL, metaJSON).Scan(&contactID)
+		`, orgID, in.FirstName, in.LastName, in.FullName, in.Company, in.JobTitle, in.LinkedInURL, metaJSON).Scan(&contactID)
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.Lock()
-	s.inMemory.contacts = append(s.inMemory.contacts, map[string]any{
-		"id":           contactID,
-		"first_name":   in.FirstName,
-		"last_name":    in.LastName,
-		"full_name":    in.FullName,
-		"company":      in.Company,
-		"job_title":    in.JobTitle,
-		"linkedin_url": in.LinkedInURL,
-		"status":       "pending",
-		"created_at":   time.Now(),
-	})
-	s.inMemory.mu.Unlock()
-
-	s.broker.Publish(claims.OrganizationID, "contact.created", map[string]any{"contact_id": contactID})
+	s.broker.Publish(orgID, "contact.created", map[string]any{"contact_id": contactID})
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":      contactID,
@@ -613,12 +792,17 @@ func (s *Server) HandleCreateContact(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleListContacts(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 	status := r.URL.Query().Get("status")
 	search := r.URL.Query().Get("search")
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		rows, err := s.pgClient.Pool.Query(r.Context(), `
+	contacts := []map[string]any{}
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(r.Context(), `
 			SELECT id, first_name, last_name, full_name, company, job_title, linkedin_url, status, created_at
 			FROM contacts
 			WHERE organization_id = $1
@@ -626,111 +810,121 @@ func (s *Server) HandleListContacts(w http.ResponseWriter, r *http.Request) {
 			  AND ($3 = '' OR full_name ILIKE '%' || $3 || '%' OR company ILIKE '%' || $3 || '%')
 			ORDER BY created_at DESC
 			LIMIT 200
-		`, claims.OrganizationID, status, search)
-
-		if err == nil {
-			defer rows.Close()
-			var contacts []map[string]any
-			for rows.Next() {
-				var id uuid.UUID
-				var fn, ln, full, comp, job, url, st string
-				var cr time.Time
-				if err := rows.Scan(&id, &fn, &ln, &full, &comp, &job, &url, &st, &cr); err == nil {
-					contacts = append(contacts, map[string]any{
-						"id":           id,
-						"first_name":   fn,
-						"last_name":    ln,
-						"full_name":    full,
-						"company":      comp,
-						"job_title":    job,
-						"linkedin_url": url,
-						"status":       st,
-						"created_at":   cr,
-					})
-				}
-			}
-			if contacts == nil {
-				contacts = []map[string]any{}
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"contacts": contacts, "total": len(contacts)})
-			return
+		`, orgID, status, search)
+		if err != nil {
+			return err
 		}
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			var fn, ln, full, comp, job, url, st string
+			var cr time.Time
+			if err := rows.Scan(&id, &fn, &ln, &full, &comp, &job, &url, &st, &cr); err == nil {
+				contacts = append(contacts, map[string]any{
+					"id":           id,
+					"first_name":   fn,
+					"last_name":    ln,
+					"full_name":    full,
+					"company":      comp,
+					"job_title":    job,
+					"linkedin_url": url,
+					"status":       st,
+					"created_at":   cr,
+				})
+			}
+		}
+		return rows.Err()
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.RLock()
-	list := s.inMemory.contacts
-	s.inMemory.mu.RUnlock()
-
-	writeJSON(w, http.StatusOK, map[string]any{"contacts": list, "total": len(list)})
+	writeJSON(w, http.StatusOK, map[string]any{"contacts": contacts, "total": len(contacts)})
 }
 
 func (s *Server) HandleGetContact(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 	contactID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_CONTACT_ID", "invalid contact id", nil)
 		return
 	}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		var id uuid.UUID
-		var fn, ln, full, comp, job, url, st string
-		var metaJSON []byte
-		var cr time.Time
+	var (
+		id                                       uuid.UUID
+		fn, ln, full, comp, job, url, st         string
+		metaJSON                                 []byte
+		cr                                       time.Time
+		found                                    bool
+	)
 
-		err = s.pgClient.Pool.QueryRow(r.Context(), `
+	// Linha inexistente ou de outro tenant (RLS retorna zero linhas) =
+	// CONTACT_NOT_FOUND honesto (404), não 503: ErrNoRows é absorvido.
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		err := tx.QueryRow(r.Context(), `
 			SELECT id, first_name, last_name, full_name, company, job_title, linkedin_url, status, metadata, created_at
 			FROM contacts
 			WHERE organization_id = $1 AND id = $2
-		`, claims.OrganizationID, contactID).Scan(&id, &fn, &ln, &full, &comp, &job, &url, &st, &metaJSON, &cr)
-
-		if err == nil {
-			var meta map[string]any
-			_ = json.Unmarshal(metaJSON, &meta)
-			writeJSON(w, http.StatusOK, map[string]any{
-				"id":           id,
-				"first_name":   fn,
-				"last_name":    ln,
-				"full_name":    full,
-				"company":      comp,
-				"job_title":    job,
-				"linkedin_url": url,
-				"status":       st,
-				"metadata":     meta,
-				"created_at":   cr,
-			})
-			return
+		`, orgID, contactID).Scan(&id, &fn, &ln, &full, &comp, &job, &url, &st, &metaJSON, &cr)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
 		}
+		found = true
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact not found", nil)
+	if !found {
+		writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact not found", nil)
+		return
+	}
+
+	var meta map[string]any
+	_ = json.Unmarshal(metaJSON, &meta)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":           id,
+		"first_name":   fn,
+		"last_name":    ln,
+		"full_name":    full,
+		"company":      comp,
+		"job_title":    job,
+		"linkedin_url": url,
+		"status":       st,
+		"metadata":     meta,
+		"created_at":   cr,
+	})
 }
 
 func (s *Server) HandleDeleteContact(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 	contactID, _ := uuid.Parse(chi.URLParam(r, "id"))
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(r.Context(), `
 			DELETE FROM contacts WHERE organization_id = $1 AND id = $2
-		`, claims.OrganizationID, contactID)
+		`, orgID, contactID)
+		return err
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
-
-	s.inMemory.mu.Lock()
-	newContacts := make([]map[string]any, 0)
-	for _, c := range s.inMemory.contacts {
-		if c["id"] != contactID {
-			newContacts = append(newContacts, c)
-		}
-	}
-	s.inMemory.contacts = newContacts
-	s.inMemory.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) HandleImportContactsCSV(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 
 	file, _, err := r.FormFile("file")
 	if err != nil {
@@ -748,16 +942,28 @@ func (s *Server) HandleImportContactsCSV(w http.ResponseWriter, r *http.Request)
 
 	colIdx := make(map[string]int)
 	for i, col := range header {
-		colIdx[strings.ToLower(strings.TrimSpace(col))] = i
+		// CSVs do mundo real chegam com BOM de export do Excel/Google e
+		// cabeçalhos como "LinkedIn URL", "Full Name" (espaço em vez de
+		// underscore): normaliza para casar com os aliases abaixo.
+		norm := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(col, "\ufeff")))
+		norm = strings.Join(strings.Fields(norm), "_")
+		colIdx[norm] = i
 	}
 
+	// CSV inteiro numa única transação com tenant: ou importa tudo com
+	// RLS correto ou responde 503 honesto (sem meia-importação).
 	var inserted, skipped int
+	type csvRow struct {
+		fn, ln, full, comp, job, url string
+	}
+	rows := make([]csvRow, 0)
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			skipped++
 			continue
 		}
 
@@ -772,10 +978,10 @@ func (s *Server) HandleImportContactsCSV(w http.ResponseWriter, r *http.Request)
 
 		fn := getVal("first_name", "firstname", "nome")
 		ln := getVal("last_name", "lastname", "sobrenome")
-		full := getVal("full_name", "name", "nome completo")
+		full := getVal("full_name", "name", "nome_completo")
 		comp := getVal("company", "empresa")
 		job := getVal("job_title", "title", "cargo")
-		url := getVal("linkedin_url", "linkedin", "profile")
+		url := getVal("linkedin_url", "linkedin", "profile", "url_do_linkedin", "url", "link")
 
 		if full == "" && fn != "" {
 			full = strings.TrimSpace(fn + " " + ln)
@@ -784,39 +990,55 @@ func (s *Server) HandleImportContactsCSV(w http.ResponseWriter, r *http.Request)
 			skipped++
 			continue
 		}
-
-		contactID := uuid.New()
-		if s.pgClient != nil && s.pgClient.Pool != nil {
-			_ = s.pgClient.Pool.QueryRow(r.Context(), `
-				INSERT INTO contacts (
-					organization_id, first_name, last_name, full_name, company, job_title, linkedin_url
-				) VALUES ($1, $2, $3, $4, $5, $6, $7)
-				ON CONFLICT (organization_id, linkedin_url) DO UPDATE SET
-					first_name = EXCLUDED.first_name,
-					last_name = EXCLUDED.last_name,
-					full_name = EXCLUDED.full_name,
-					company = EXCLUDED.company,
-					job_title = EXCLUDED.job_title,
-					updated_at = NOW()
-				RETURNING id
-			`, claims.OrganizationID, fn, ln, full, comp, job, url).Scan(&contactID)
-		}
-
-		s.inMemory.mu.Lock()
-		s.inMemory.contacts = append(s.inMemory.contacts, map[string]any{
-			"id":           contactID,
-			"first_name":   fn,
-			"last_name":    ln,
-			"full_name":    full,
-			"company":      comp,
-			"job_title":    job,
-			"linkedin_url": url,
-			"status":       "pending",
-			"created_at":   time.Now(),
-		})
-		s.inMemory.mu.Unlock()
-		inserted++
+		rows = append(rows, csvRow{fn, ln, full, comp, job, url})
 	}
+
+	batch := make([]pgx.NamedArgs, 0, len(rows))
+	for _, row := range rows {
+		batch = append(batch, pgx.NamedArgs{
+			"org":  orgID,
+			"fn":   row.fn,
+			"ln":   row.ln,
+			"full": row.full,
+			"comp": row.comp,
+			"job":  row.job,
+			"url":  row.url,
+		})
+	}
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		// INSERT em lote (pgx.Batch pipelined): COPY FROM não é suportado com
+		// RLS ativa (SQLSTATE 0A000), então a importação não pode usar CopyFrom.
+		const chunk = 500
+		for start := 0; start < len(batch); start += chunk {
+			end := start + chunk
+			if end > len(batch) {
+				end = len(batch)
+			}
+			b := &pgx.Batch{}
+			for _, row := range batch[start:end] {
+				b.Queue(`
+					INSERT INTO contacts (organization_id, first_name, last_name, full_name, company, job_title, linkedin_url)
+					VALUES (@org, @fn, @ln, @full, @comp, @job, @url)
+				`, row)
+			}
+			if err := tx.SendBatch(r.Context(), b).Close(); err != nil {
+				return err
+			}
+		}
+		// Dedup pós-insert sob o mesmo tenant (mesma URL do LinkedIn: mantém
+		// a última linha, que é a versão mais recente do arquivo).
+		_, err := tx.Exec(r.Context(), `
+			DELETE FROM contacts a USING contacts b
+			WHERE a.organization_id = $1 AND b.organization_id = $1
+			  AND a.linkedin_url = b.linkedin_url AND a.ctid < b.ctid
+		`, orgID)
+		return err
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
+	inserted = len(rows)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":   "completed",
@@ -830,10 +1052,9 @@ type SyncLinkedInRequest struct {
 }
 
 func (s *Server) HandleSyncLinkedInContacts(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
 	var req SyncLinkedInRequest
@@ -847,148 +1068,103 @@ func (s *Server) HandleSyncLinkedInContacts(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// If no connections sent, seed real 1st degree connections from connected account
+	// B2: sem conexões enviadas não há nada a sincronizar — corpo vazio
+	// responde synced=0 honesto (o seed fictício de 5 contatos foi removido
+	// na Fase E; ver §5 item 8 do PRD).
 	if len(req.Connections) == 0 {
-		req.Connections = []ContactInput{
-			{
-				FirstName:   "Carlos",
-				LastName:    "Eduardo",
-				FullName:    "Carlos Eduardo",
-				Company:     "TechVentures B2B",
-				JobTitle:    "Diretor de Parcerias",
-				LinkedInURL: "https://www.linkedin.com/in/carlos-eduardo-tech",
-				Metadata:    map[string]any{"connection_degree": "1st"},
-			},
-			{
-				FirstName:   "Mariana",
-				LastName:    "Costa",
-				FullName:    "Mariana Costa",
-				Company:     "ScaleUp SaaS",
-				JobTitle:    "Head de Expansão & Growth",
-				LinkedInURL: "https://www.linkedin.com/in/mariana-costa-growth",
-				Metadata:    map[string]any{"connection_degree": "1st"},
-			},
-			{
-				FirstName:   "Roberto",
-				LastName:    "Almeida",
-				FullName:    "Roberto Almeida",
-				Company:     "Nexora Enterprise",
-				JobTitle:    "VP Comercial",
-				LinkedInURL: "https://www.linkedin.com/in/roberto-almeida-nexora",
-				Metadata:    map[string]any{"connection_degree": "1st"},
-			},
-			{
-				FirstName:   "Juliana",
-				LastName:    "Rocha",
-				FullName:    "Juliana Rocha",
-				Company:     "CloudBridge Soluções",
-				JobTitle:    "Tech Recruiter & People",
-				LinkedInURL: "https://www.linkedin.com/in/juliana-rocha-cloud",
-				Metadata:    map[string]any{"connection_degree": "1st"},
-			},
-			{
-				FirstName:   "Guilherme",
-				LastName:    "Menezes",
-				FullName:    "Guilherme Menezes",
-				Company:     "Vortex Capital",
-				JobTitle:    "Sócio e Head de Novos Negócios",
-				LinkedInURL: "https://www.linkedin.com/in/guilherme-menezes-vc",
-				Metadata:    map[string]any{"connection_degree": "1st"},
-			},
-		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":       "synced",
+			"synced":       0,
+			"synced_count": 0,
+			"message":      "no connections provided to sync",
+		})
+		return
 	}
 
-	var synced int
+	// Normaliza e deduplica por linkedin_url dentro do próprio payload.
+	type syncRow struct {
+		fn, ln, full, comp, job, url string
+		meta                          []byte
+	}
+	seen := make(map[string]bool)
+	rows := make([]syncRow, 0, len(req.Connections))
 	for _, c := range req.Connections {
-		if c.LinkedInURL == "" {
+		if c.LinkedInURL == "" || seen[c.LinkedInURL] {
 			continue
 		}
-		if c.FullName == "" && c.FirstName != "" {
-			c.FullName = strings.TrimSpace(c.FirstName + " " + c.LastName)
+		seen[c.LinkedInURL] = true
+		full := c.FullName
+		if full == "" && c.FirstName != "" {
+			full = strings.TrimSpace(c.FirstName + " " + c.LastName)
 		}
-
-		contactID := uuid.New()
-		if s.pgClient != nil && s.pgClient.Pool != nil {
-			metaJSON, _ := json.Marshal(c.Metadata)
-			_, _ = s.pgClient.Pool.Exec(r.Context(), `
-				INSERT INTO contacts (
-					organization_id, first_name, last_name, full_name, company, job_title, linkedin_url, status, metadata
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'waiting', $8)
-				ON CONFLICT (organization_id, linkedin_url) DO UPDATE SET
-					first_name = EXCLUDED.first_name,
-					last_name = EXCLUDED.last_name,
-					full_name = EXCLUDED.full_name,
-					company = EXCLUDED.company,
-					job_title = EXCLUDED.job_title,
-					metadata = EXCLUDED.metadata,
-					updated_at = NOW()
-			`, orgID, c.FirstName, c.LastName, c.FullName, c.Company, c.JobTitle, c.LinkedInURL, metaJSON)
-		}
-
-		s.inMemory.mu.Lock()
-		exists := false
-		for _, ex := range s.inMemory.contacts {
-			if ex["linkedin_url"] == c.LinkedInURL {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			s.inMemory.contacts = append(s.inMemory.contacts, map[string]any{
-				"id":           contactID,
-				"first_name":   c.FirstName,
-				"last_name":    c.LastName,
-				"full_name":    c.FullName,
-				"company":      c.Company,
-				"job_title":    c.JobTitle,
-				"linkedin_url": c.LinkedInURL,
-				"status":       "waiting",
-				"created_at":   time.Now(),
-			})
-		}
-		s.inMemory.mu.Unlock()
-		synced++
+		metaJSON, _ := json.Marshal(c.Metadata)
+		rows = append(rows, syncRow{c.FirstName, c.LastName, full, c.Company, c.JobTitle, c.LinkedInURL, metaJSON})
 	}
 
-	s.inMemory.mu.Lock()
-	s.inMemory.activity = append([]map[string]any{
-		{
-			"id":          uuid.New().String(),
-			"event_type":  "contacts.synced",
-			"description": fmt.Sprintf("%d conexões sincronizadas com sucesso do LinkedIn", synced),
-			"created_at":  time.Now(),
-		},
-	}, s.inMemory.activity...)
-	s.inMemory.mu.Unlock()
+	batch := make([][]any, 0, len(rows))
+	for _, row := range rows {
+		batch = append(batch, []any{orgID, row.fn, row.ln, row.full, row.comp, row.job, row.url, row.meta})
+	}
 
-	s.broker.Publish(orgID, "contacts.synced", map[string]any{"synced_count": synced})
+	// Sync inteiro numa única transação com tenant: COPY sob RLS + dedup
+	// pós-copy restrito à org (o filtro organization_id no USING é
+	// obrigatório — sem ele, linhas de outros tenants seriam apagadas).
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if _, err := tx.CopyFrom(
+			r.Context(),
+			pgx.Identifier{"contacts"},
+			[]string{"organization_id", "first_name", "last_name", "full_name", "company", "job_title", "linkedin_url", "metadata"},
+			pgx.CopyFromRows(batch),
+		); err != nil {
+			return err
+		}
+		_, err := tx.Exec(r.Context(), `
+			DELETE FROM contacts a USING contacts b
+			WHERE a.organization_id = $1 AND b.organization_id = $1
+			  AND a.linkedin_url = b.linkedin_url AND a.ctid < b.ctid
+		`, orgID)
+		return err
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
+	s.broker.Publish(orgID, "contacts.synced", map[string]any{"synced_count": len(rows)})
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":       "synced",
-		"synced":       synced,
-		"synced_count": synced,
-		"message":      fmt.Sprintf("%d conexões sincronizadas com sucesso!", synced),
+		"synced":       len(rows),
+		"synced_count": len(rows),
+		"message":      fmt.Sprintf("%d conexões sincronizadas com sucesso!", len(rows)),
 	})
 }
 
 // --- Campaigns & Flow Builder (Section 16, 17, 18, 21, 22) ---
 
 type CampaignInput struct {
-	Name             string `json:"name"`
-	Description      string `json:"description"`
-	DailyLimit       int    `json:"daily_limit"`
-	AllowedStartTime string `json:"allowed_start_time"`
-	AllowedEndTime   string `json:"allowed_end_time"`
-	Timezone         string `json:"timezone"`
-	IsFlowCustom     bool   `json:"is_flow_custom"`
+	Name             string      `json:"name"`
+	Description      string      `json:"description"`
+	DailyLimit       int         `json:"daily_limit"`
+	AllowedStartTime string      `json:"allowed_start_time"`
+	AllowedEndTime   string      `json:"allowed_end_time"`
+	Timezone         string      `json:"timezone"`
+	IsFlowCustom     bool        `json:"is_flow_custom"`
+	ContactIDs       []uuid.UUID `json:"contact_ids"` // vazio = todos os contatos da org
 }
 
 func (s *Server) HandleListCampaigns(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		rows, err := s.pgClient.Pool.Query(r.Context(), `
-			SELECT 
+	list := []map[string]any{}
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(r.Context(), `
+			SELECT
 				c.id, c.name, c.description, c.status, c.daily_limit, c.created_at,
 				COALESCE(COUNT(cc.id), 0) AS total_contacts,
 				COALESCE(COUNT(cc.id) FILTER (WHERE cc.status IN ('active', 'waiting')), 0) AS active_contacts,
@@ -999,49 +1175,45 @@ func (s *Server) HandleListCampaigns(w http.ResponseWriter, r *http.Request) {
 			WHERE c.organization_id = $1
 			GROUP BY c.id
 			ORDER BY c.created_at DESC
-		`, claims.OrganizationID)
-
-		if err == nil {
-			defer rows.Close()
-			var list []map[string]any
-			for rows.Next() {
-				var id uuid.UUID
-				var name, desc, status string
-				var limit, total, active, replied, completed int
-				var cr time.Time
-
-				if err := rows.Scan(&id, &name, &desc, &status, &limit, &cr, &total, &active, &replied, &completed); err == nil {
-					list = append(list, map[string]any{
-						"id":                 id,
-						"name":               name,
-						"description":        desc,
-						"status":             status,
-						"daily_limit":        limit,
-						"created_at":         cr,
-						"total_contacts":     total,
-						"active_contacts":    active,
-						"replied_contacts":   replied,
-						"completed_contacts": completed,
-					})
-				}
-			}
-			if list == nil {
-				list = []map[string]any{}
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"campaigns": list})
-			return
+		`, orgID)
+		if err != nil {
+			return err
 		}
-	}
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			var name, desc, status string
+			var limit, total, active, replied, completed int
+			var cr time.Time
 
-	s.inMemory.mu.RLock()
-	list := s.inMemory.campaigns
-	s.inMemory.mu.RUnlock()
+			if err := rows.Scan(&id, &name, &desc, &status, &limit, &cr, &total, &active, &replied, &completed); err == nil {
+				list = append(list, map[string]any{
+					"id":                 id,
+					"name":               name,
+					"description":        desc,
+					"status":             status,
+					"daily_limit":        limit,
+					"created_at":         cr,
+					"total_contacts":     total,
+					"active_contacts":    active,
+					"replied_contacts":   replied,
+					"completed_contacts": completed,
+				})
+			}
+		}
+		return rows.Err()
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"campaigns": list})
 }
 
 func (s *Server) HandleCreateCampaign(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 	var in CampaignInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body", nil)
@@ -1055,86 +1227,85 @@ func (s *Server) HandleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 
 	campID := uuid.New()
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_ = s.pgClient.Pool.QueryRow(r.Context(), `
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(r.Context(), `
 			INSERT INTO campaigns (
 				organization_id, name, description, status, daily_limit,
 				allowed_start_time, allowed_end_time, timezone, is_flow_custom
 			) VALUES ($1, $2, $3, 'draft', $4, $5::time, $6::time, $7, $8)
 			RETURNING id
-		`, claims.OrganizationID, in.Name, in.Description, in.DailyLimit, in.AllowedStartTime, in.AllowedEndTime, in.Timezone, in.IsFlowCustom).Scan(&campID)
+		`, orgID, in.Name, in.Description, in.DailyLimit, in.AllowedStartTime, in.AllowedEndTime, in.Timezone, in.IsFlowCustom).Scan(&campID); err != nil {
+			return err
+		}
+		// Lista selecionável por campanha (todos marcados no UI por default):
+		// os contatos escolhidos entram na cadência já na criação; vazio =
+		// campanha sem lista ainda (start popula com todos).
+		return stageCampaignContacts(tx, orgID, campID, in.ContactIDs)
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.Lock()
-	s.inMemory.campaigns = append(s.inMemory.campaigns, map[string]any{
-		"id":          campID,
-		"name":        in.Name,
-		"description": in.Description,
-		"status":      "draft",
-		"daily_limit": in.DailyLimit,
-		"timezone":    in.Timezone,
-		"created_at":  time.Now(),
-	})
-	s.inMemory.mu.Unlock()
-
-	s.broker.Publish(claims.OrganizationID, "campaign.created", map[string]any{"campaign_id": campID})
+	s.broker.Publish(orgID, "campaign.created", map[string]any{"campaign_id": campID})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": campID, "status": "draft"})
 }
 
 func (s *Server) HandleGetCampaign(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
 	campID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_CAMPAIGN_ID", "invalid campaign id", nil)
 		return
 	}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		var id uuid.UUID
-		var name, desc, status, tz string
-		var limit int
-		var startTime, endTime time.Time
-		var isCustom bool
-		var cr, up time.Time
-		var startedAt, pausedAt *time.Time
+	var (
+		id                                       uuid.UUID
+		name, desc, status, tz                   string
+		limit                                    int
+		startTime, endTime                       time.Time
+		isCustom                                 bool
+		cr, up                                   time.Time
+		startedAt, pausedAt                      *time.Time
+		found                                    bool
+	)
 
-		err = s.pgClient.Pool.QueryRow(r.Context(), `
+	// Campanha inexistente ou de outro tenant = CAMPAIGN_NOT_FOUND (404),
+	// ErrNoRows absorvido no callback; demais erros abortam em 503.
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		err := tx.QueryRow(r.Context(), `
 			SELECT id, name, description, status, daily_limit, allowed_start_time, allowed_end_time,
 			       timezone, is_flow_custom, started_at, paused_at, created_at, updated_at
 			FROM campaigns
 			WHERE organization_id = $1 AND id = $2
-		`, claims.OrganizationID, campID).Scan(&id, &name, &desc, &status, &limit, &startTime, &endTime, &tz, &isCustom, &startedAt, &pausedAt, &cr, &up)
-
-		if err == nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"id":             id,
-				"name":           name,
-				"description":    desc,
-				"status":         status,
-				"daily_limit":    limit,
-				"timezone":       tz,
-				"is_flow_custom": isCustom,
-				"created_at":     cr,
-			})
-			return
+		`, orgID, campID).Scan(&id, &name, &desc, &status, &limit, &startTime, &endTime, &tz, &isCustom, &startedAt, &pausedAt, &cr, &up)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
 		}
+		found = true
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.RLock()
-	for _, c := range s.inMemory.campaigns {
-		if c["id"] == campID {
-			s.inMemory.mu.RUnlock()
-			writeJSON(w, http.StatusOK, c)
-			return
-		}
+	if !found {
+		writeAPIError(w, http.StatusNotFound, "CAMPAIGN_NOT_FOUND", "campaign not found", nil)
+		return
 	}
-	s.inMemory.mu.RUnlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":          campID,
-		"name":        "Campanha VibexCorp",
-		"status":      "draft",
-		"daily_limit": 30,
+		"id":             id,
+		"name":           name,
+		"description":    desc,
+		"status":         status,
+		"daily_limit":    limit,
+		"timezone":       tz,
+		"is_flow_custom": isCustom,
+		"created_at":     cr,
 	})
 }
 
@@ -1153,54 +1324,120 @@ type SaveStepsRequest struct {
 }
 
 func (s *Server) HandleGetCampaignSteps(w http.ResponseWriter, r *http.Request) {
-	campID := chi.URLParam(r, "id")
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
+	campUUID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_CAMPAIGN_ID", "invalid campaign id", nil)
+		return
+	}
 
-	s.inMemory.mu.RLock()
-	steps, ok := s.inMemory.steps[campID]
-	s.inMemory.mu.RUnlock()
+	steps := []map[string]any{}
 
-	if !ok || len(steps) == 0 {
-		steps = []map[string]any{
-			{
-				"position":      1,
-				"step_type":     "MESSAGE",
-				"name":          "Mensagem Inicial",
-				"template_body": "Olá {{first_name}}, vi que atua na {{company}} como {{job_title}}...",
-				"delay_amount":  0,
-				"delay_unit":    "days",
-			},
+	// Steps da campanha do próprio tenant; campanha de outro tenant não
+	// existe para este orgID (RLS) → lista vazia honesta, nunca step fixo.
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(r.Context(), `
+			SELECT position, step_type, name, template_body, delay_amount, delay_unit, conditions
+			FROM campaign_steps
+			WHERE organization_id = $1 AND campaign_id = $2
+			ORDER BY position ASC
+		`, orgID, campUUID)
+		if err != nil {
+			return err
 		}
+		defer rows.Close()
+		for rows.Next() {
+			var position, delayAmount int
+			var stepType, name, templateBody, delayUnit string
+			var condJSON []byte
+			if err := rows.Scan(&position, &stepType, &name, &templateBody, &delayAmount, &delayUnit, &condJSON); err != nil {
+				continue
+			}
+			var cond map[string]any
+			_ = json.Unmarshal(condJSON, &cond)
+			steps = append(steps, map[string]any{
+				"position":      position,
+				"step_type":     stepType,
+				"name":          name,
+				"template_body": templateBody,
+				"delay_amount":  delayAmount,
+				"delay_unit":    delayUnit,
+				"conditions":    cond,
+			})
+		}
+		return rows.Err()
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"steps": steps})
 }
 
 func (s *Server) HandleSaveCampaignSteps(w http.ResponseWriter, r *http.Request) {
-	campID := chi.URLParam(r, "id")
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
+	campStr := chi.URLParam(r, "id")
+	campUUID, err := uuid.Parse(campStr)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_CAMPAIGN_ID", "invalid campaign id", nil)
+		return
+	}
 	var req SaveStepsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request body", nil)
 		return
 	}
 
-	mapped := make([]map[string]any, 0)
-	for _, step := range req.Steps {
-		mapped = append(mapped, map[string]any{
-			"position":      step.Position,
-			"step_type":     step.StepType,
-			"name":          step.Name,
-			"template_body": step.TemplateBody,
-			"delay_amount":  step.DelayAmount,
-			"delay_unit":    step.DelayUnit,
-			"conditions":    step.Conditions,
-		})
+	// Troca atômica dos steps sob o tenant: apaga e reinsere na mesma
+	// transação; campanha de outro tenant não é afetada (0 linhas) e o
+	// resultado informa quantos steps foram persistidos.
+	var saved int
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		var owned bool
+		if err := tx.QueryRow(r.Context(), `
+			SELECT EXISTS(SELECT 1 FROM campaigns WHERE organization_id = $1 AND id = $2)
+		`, orgID, campUUID).Scan(&owned); err != nil {
+			return err
+		}
+		if !owned {
+			return errCampaignNotOwned
+		}
+		if _, err := tx.Exec(r.Context(), `
+			DELETE FROM campaign_steps WHERE organization_id = $1 AND campaign_id = $2
+		`, orgID, campUUID); err != nil {
+			return err
+		}
+		for _, step := range req.Steps {
+			condJSON, _ := json.Marshal(step.Conditions)
+			if condJSON == nil {
+				condJSON = []byte("{}")
+			}
+			if _, err := tx.Exec(r.Context(), `
+				INSERT INTO campaign_steps (
+					organization_id, campaign_id, position, step_type, name,
+					template_body, delay_amount, delay_unit, conditions
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			`, orgID, campUUID, step.Position, step.StepType, step.Name,
+				step.TemplateBody, step.DelayAmount, step.DelayUnit, condJSON); err != nil {
+				return err
+			}
+			saved++
+		}
+		return nil
+	}) {
+		if errors.Is(tenantTxErr, errCampaignNotOwned) {
+			writeAPIError(w, http.StatusNotFound, "CAMPAIGN_NOT_FOUND", "campaign not found", nil)
+			return
+		}
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	s.inMemory.mu.Lock()
-	s.inMemory.steps[campID] = mapped
-	s.inMemory.mu.Unlock()
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "saved", "saved": saved})
 }
 
 type PreviewItem struct {
@@ -1212,42 +1449,213 @@ type PreviewItem struct {
 }
 
 func (s *Server) HandleCampaignPreview(w http.ResponseWriter, r *http.Request) {
-	previews := []PreviewItem{
-		{
-			ContactName: "Lucas Silva",
-			Company:     "VibexCorp",
-			Rendered:    "Olá Lucas, vi que você atua na VibexCorp como Tech Lead e queria trocar uma ideia rápida...",
-			Blocked:     false,
-		},
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
+	campUUID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_CAMPAIGN_ID", "invalid campaign id", nil)
+		return
+	}
+
+	// Preview honesto (Fase E): renderiza o template MESSAGE de menor posição
+	// da campanha contra os contatos reais da cadência (tenant, RLS).
+	// Campanha sem steps ou sem contatos = previews vazios + can_launch=false
+	// (nunca "Lucas Silva"/can_launch:true fictícios).
+	var (
+		template   string
+		haveSteps  bool
+		canLaunch  bool
+		previews   = []PreviewItem{}
+	)
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		// Campanha precisa pertencer ao tenant.
+		var exists int
+		if err := tx.QueryRow(r.Context(), `
+			SELECT COUNT(*) FROM campaigns
+			WHERE organization_id = $1 AND id = $2
+		`, orgID, campUUID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return errCampaignNotOwned
+		}
+
+		if err := tx.QueryRow(r.Context(), `
+			SELECT template_body FROM campaign_steps
+			WHERE organization_id = $1 AND campaign_id = $2 AND step_type = 'MESSAGE'
+			ORDER BY position ASC
+			LIMIT 1
+		`, orgID, campUUID).Scan(&template); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		haveSteps = true
+
+		rows, err := tx.Query(r.Context(), `
+			SELECT c.first_name, c.full_name, c.company, c.job_title
+			FROM campaign_contacts cc
+			JOIN contacts c ON c.id = cc.contact_id AND c.organization_id = $1
+			WHERE cc.organization_id = $1 AND cc.campaign_id = $2
+			ORDER BY cc.created_at ASC
+			LIMIT 5
+		`, orgID, campUUID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var fn, full, comp, job string
+			if err := rows.Scan(&fn, &full, &comp, &job); err != nil {
+				continue
+			}
+			rendered := template
+			rendered = strings.ReplaceAll(rendered, "{{first_name}}", fn)
+			rendered = strings.ReplaceAll(rendered, "{{full_name}}", full)
+			rendered = strings.ReplaceAll(rendered, "{{company}}", comp)
+			rendered = strings.ReplaceAll(rendered, "{{job_title}}", job)
+			blocked := strings.Contains(rendered, "{{")
+			missing := ""
+			if blocked {
+				if idx := strings.Index(rendered, "{{"); idx >= 0 {
+					if end := strings.Index(rendered[idx:], "}}"); end >= 0 {
+						missing = rendered[idx+2 : idx+end]
+					}
+				}
+			}
+			previews = append(previews, PreviewItem{
+				ContactName: full,
+				Company:     comp,
+				Rendered:    rendered,
+				Blocked:     blocked,
+				MissingVar:  missing,
+			})
+		}
+		return rows.Err()
+	}) {
+		if errors.Is(tenantTxErr, errCampaignNotOwned) {
+			writeAPIError(w, http.StatusNotFound, "CAMPAIGN_NOT_FOUND", "campaign not found", nil)
+			return
+		}
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
+	if haveSteps && len(previews) > 0 {
+		blocked := false
+		for _, p := range previews {
+			if p.Blocked {
+				blocked = true
+				break
+			}
+		}
+		canLaunch = !blocked
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"previews":   previews,
-		"can_launch": true,
+		"can_launch": canLaunch,
 	})
 }
 
-func (s *Server) HandleStartCampaign(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	campID, _ := uuid.Parse(chi.URLParam(r, "id"))
+// stageCampaignContacts liga os contatos selecionados à campanha (o INSERT em
+// campaign_contacts que faltava no pipeline). Valida que os ids pertencem à
+// org (RLS: id de outra org não conta linha); dedup pelo UNIQUE(campaign,
+// contact). Sem ids: no-op (campanha ainda sem lista).
+func stageCampaignContacts(tx pgx.Tx, orgID, campID uuid.UUID, contactIDs []uuid.UUID) error {
+	if len(contactIDs) == 0 {
+		return nil
+	}
+	for _, cid := range contactIDs {
+		if _, err := tx.Exec(context.Background(), `
+			INSERT INTO campaign_contacts
+				(organization_id, campaign_id, contact_id, status, current_position, next_execution_at, started_at)
+			VALUES ($1, $2, $3, 'pending', 1, NULL, NULL)
+			ON CONFLICT (campaign_id, contact_id) DO NOTHING
+		`, orgID, campID, cid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
+// populateAllContacts entra em cena quando a campanha é iniciada sem lista
+// explicitamente escolhida: toda a base de contatos da org entra na cadência.
+// Campanha de outra org → 0 linhas no guard → 404 honesto.
+func (s *Server) populateAllContacts(w http.ResponseWriter, r *http.Request, orgID, campID uuid.UUID) bool {
+	var owned bool
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(r.Context(), `
+			SELECT EXISTS(
+				SELECT 1 FROM campaigns WHERE organization_id = $1 AND id = $2
+			)
+		`, orgID, campID).Scan(&owned); err != nil {
+			return err
+		}
+		if !owned {
+			return errCampaignNotOwned
+		}
+		_, err := tx.Exec(r.Context(), `
+			INSERT INTO campaign_contacts
+				(organization_id, campaign_id, contact_id, status, current_position, next_execution_at, started_at)
+			SELECT $1, $2, id, 'pending', 1, NULL, NULL FROM contacts WHERE organization_id = $1
+			ON CONFLICT (campaign_id, contact_id) DO NOTHING
+		`, orgID, campID)
+		return err
+	}) {
+		return false // 503 já respondido pelo helper (404 tratado abaixo)
+	}
+	if !owned {
+		writeAPIError(w, http.StatusNotFound, "CAMPAIGN_NOT_FOUND", "campaign not found", nil)
+		return false
+	}
+	return true
+}
+
+func (s *Server) HandleStartCampaign(w http.ResponseWriter, r *http.Request) {
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
+	}
+	campID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_CAMPAIGN_ID", "invalid campaign id", nil)
+		return
+	}
+
+	// UPDATE restrito ao tenant: campanha de outra org não é tocada
+	// (0 linhas) e vira 404 honesto; demais erros abortam em 503.
+	var updated bool
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		cmd, err := tx.Exec(r.Context(), `
 			UPDATE campaigns
 			SET status = 'running', started_at = COALESCE(started_at, NOW()), updated_at = NOW()
 			WHERE organization_id = $1 AND id = $2
-		`, claims.OrganizationID, campID)
-	}
-
-	s.inMemory.mu.Lock()
-	for _, c := range s.inMemory.campaigns {
-		if c["id"] == campID {
-			c["status"] = "running"
+		`, orgID, campID)
+		if err != nil {
+			return err
 		}
+		updated = cmd.RowsAffected() > 0
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
-	s.inMemory.mu.Unlock()
+	if !updated {
+		writeAPIError(w, http.StatusNotFound, "CAMPAIGN_NOT_FOUND", "campaign not found", nil)
+		return
+	}
 
-	s.broker.Publish(claims.OrganizationID, "campaign.started", map[string]any{"campaign_id": campID})
+	// Campanha iniciada sem lista escolhida: toda a base de contatos da org
+	// entra na cadência (o pipeline real precisa das linhas em campaign_contacts
+	// para existir; sem isso o worker nunca tinha trabalho).
+	if !s.populateAllContacts(w, r, orgID, campID) {
+		return
+	}
+
+	s.broker.Publish(orgID, "campaign.started", map[string]any{"campaign_id": campID})
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "running",
@@ -1256,72 +1664,70 @@ func (s *Server) HandleStartCampaign(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandlePauseCampaign(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
-	campID, _ := uuid.Parse(chi.URLParam(r, "id"))
+	campID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_CAMPAIGN_ID", "invalid campaign id", nil)
+		return
+	}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
+	var updated bool
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		cmd, err := tx.Exec(r.Context(), `
 			UPDATE campaigns
 			SET status = 'paused', paused_at = NOW(), updated_at = NOW()
 			WHERE organization_id = $1 AND id = $2
 		`, orgID, campID)
-	}
-
-	s.inMemory.mu.Lock()
-	for _, c := range s.inMemory.campaigns {
-		if c["id"] == campID {
-			c["status"] = "paused"
+		if err != nil {
+			return err
 		}
+		updated = cmd.RowsAffected() > 0
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
-	s.inMemory.activity = append([]map[string]any{
-		{
-			"id":          uuid.New().String(),
-			"event_type":  "campaign.paused",
-			"description": "Campanha de outreach pausada pelo operador",
-			"created_at":  time.Now(),
-		},
-	}, s.inMemory.activity...)
-	s.inMemory.mu.Unlock()
+	if !updated {
+		writeAPIError(w, http.StatusNotFound, "CAMPAIGN_NOT_FOUND", "campaign not found", nil)
+		return
+	}
 
 	s.broker.Publish(orgID, "campaign.paused", map[string]any{"campaign_id": campID})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "paused", "message": "campaign paused successfully"})
 }
 
 func (s *Server) HandleResumeCampaign(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
-	campID, _ := uuid.Parse(chi.URLParam(r, "id"))
+	campID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_CAMPAIGN_ID", "invalid campaign id", nil)
+		return
+	}
 
-	if s.pgClient != nil && s.pgClient.Pool != nil {
-		_, _ = s.pgClient.Pool.Exec(r.Context(), `
+	var updated bool
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		cmd, err := tx.Exec(r.Context(), `
 			UPDATE campaigns
 			SET status = 'running', updated_at = NOW()
 			WHERE organization_id = $1 AND id = $2
 		`, orgID, campID)
-	}
-
-	s.inMemory.mu.Lock()
-	for _, c := range s.inMemory.campaigns {
-		if c["id"] == campID {
-			c["status"] = "running"
+		if err != nil {
+			return err
 		}
+		updated = cmd.RowsAffected() > 0
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
-	s.inMemory.activity = append([]map[string]any{
-		{
-			"id":          uuid.New().String(),
-			"event_type":  "campaign.resumed",
-			"description": "Campanha de outreach retomada pelo operador",
-			"created_at":  time.Now(),
-		},
-	}, s.inMemory.activity...)
-	s.inMemory.mu.Unlock()
+	if !updated {
+		writeAPIError(w, http.StatusNotFound, "CAMPAIGN_NOT_FOUND", "campaign not found", nil)
+		return
+	}
 
 	s.broker.Publish(orgID, "campaign.resumed", map[string]any{"campaign_id": campID})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "running", "message": "campaign resumed successfully"})
@@ -1332,10 +1738,9 @@ type KillSwitchRequest struct {
 }
 
 func (s *Server) HandleGlobalKillSwitch(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 	var req KillSwitchRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
@@ -1349,62 +1754,122 @@ func (s *Server) HandleGlobalKillSwitch(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) HandleSystemPauseOutreach(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 	s.safetyService.SetGlobalKillSwitch(orgID, true)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "all_outreach_paused"})
 }
 
 func (s *Server) HandleListActivity(w http.ResponseWriter, r *http.Request) {
-	s.inMemory.mu.RLock()
-	list := s.inMemory.activity
-	s.inMemory.mu.RUnlock()
-
-	if list == nil {
-		list = []map[string]any{}
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"activity": list})
+
+	// Feed de auditoria do próprio tenant (RLS); conta sem eventos = lista
+	// vazia honesta, nunca atividade de outro tenant.
+	items := make([]map[string]any, 0)
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(r.Context(), `
+			SELECT id, entity_type, entity_id, event_type, payload, created_at
+			FROM events
+			WHERE organization_id = $1
+			ORDER BY created_at DESC
+			LIMIT 50
+		`, orgID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, entityID uuid.UUID
+			var entityType, eventType string
+			var payload []byte
+			var createdAt time.Time
+			if err := rows.Scan(&id, &entityType, &entityID, &eventType, &payload, &createdAt); err != nil {
+				continue
+			}
+			var payloadMap map[string]any
+			if len(payload) > 0 {
+				_ = json.Unmarshal(payload, &payloadMap)
+			}
+			desc, _ := payloadMap["description"].(string)
+			if desc == "" {
+				desc = eventType
+			}
+			items = append(items, map[string]any{
+				"id":          id,
+				"entity_type": entityType,
+				"entity_id":   entityID,
+				"event_type":  eventType,
+				"description": desc,
+				"payload":     payloadMap,
+				"created_at":  createdAt,
+			})
+		}
+		return rows.Err()
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"activity": items})
 }
 
 func (s *Server) HandleDashboardMetrics(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
-	s.inMemory.mu.RLock()
-	isExtConnected := false
-	if cur, ok := s.inMemory.devices["current"]; ok && time.Since(cur) < 10*time.Minute {
-		isExtConnected = true
-	}
-	isLiConnected := false
-	if conn, ok := s.inMemory.account["connected"].(bool); ok && conn {
-		isLiConnected = true
-	}
-	activeCamps := 0
-	for _, c := range s.inMemory.campaigns {
-		if c["status"] == "running" {
-			activeCamps++
+	var (
+		activeCamps, contactsCount, contactedCount, replies int
+		isExtConnected, isLiConnected                        bool
+	)
+
+	// Métricas agregadas no banco sob o tenant (RLS): zero linhas de outro
+	// tenant jamais entram nas contagens. Sem store → 503 honesto.
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(r.Context(), `
+			SELECT COUNT(*) FROM campaigns
+			WHERE organization_id = $1 AND status = 'running'
+		`, orgID).Scan(&activeCamps); err != nil {
+			return err
 		}
-	}
-	contactsCount := len(s.inMemory.contacts)
-	contactedCount := 0
-	for _, c := range s.inMemory.contacts {
-		if st, ok := c["status"].(string); ok && st == "contacted" {
-			contactedCount++
+		if err := tx.QueryRow(r.Context(), `
+			SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'contacted'),
+			       COUNT(*) FILTER (WHERE status = 'replied')
+			FROM contacts WHERE organization_id = $1
+		`, orgID).Scan(&contactsCount, &contactedCount, &replies); err != nil {
+			return err
 		}
+		var extSeen, liStatus *time.Time
+		if err := tx.QueryRow(r.Context(), `
+			SELECT MAX(last_seen_at) FROM extension_devices
+			WHERE organization_id = $1 AND status = 'active'
+		`, orgID).Scan(&extSeen); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(r.Context(), `
+			SELECT MAX(last_seen_at) FROM linkedin_accounts
+			WHERE organization_id = $1 AND connection_status = 'connected'
+		`, orgID).Scan(&liStatus); err != nil {
+			return err
+		}
+		isExtConnected = extSeen != nil && time.Since(*extSeen) < 2*time.Minute
+		isLiConnected = liStatus != nil
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
-	s.inMemory.mu.RUnlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"active_campaigns":    activeCamps,
 		"contacts_in_seq":     contactsCount,
-		"waiting_followups":   contactsCount - contactedCount,
-		"replies":             0,
+		"waiting_followups":   contactsCount - contactedCount - replies,
+		"replies":             replies,
 		"completed":           contactedCount,
 		"telemetry_processed": telemetry.GlobalMetrics.JobsProcessed.Load(),
 		"kill_switch_active":  s.safetyService.IsGlobalKillSwitchActive(orgID),
@@ -1418,93 +1883,372 @@ func (s *Server) startOutreachWorker() {
 	go func() {
 		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			s.processNextOutreachStep()
+		for {
+			select {
+			case <-s.workerStop:
+				return
+			case <-ticker.C:
+				s.processNextOutreachStep()
+			}
 		}
 	}()
 }
 
-func (s *Server) processNextOutreachStep() {
-	s.inMemory.mu.Lock()
-	defer s.inMemory.mu.Unlock()
+// StopOutreachWorker encerra o ticker do worker (usado nos testes E2E: um
+// worker vivo de um teste anterior não pode processar a org de outro teste
+// em andamento — o teste controla os ticks explicitamente).
+func (s *Server) StopOutreachWorker() {
+	select {
+	case <-s.workerStop:
+	default:
+		close(s.workerStop)
+	}
+}
 
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+// O worker de outreach é multi-tenant: a cada tick itera as organizações com
+// campanha running e executa um passo por org, cada um na sua transação com
+// contexto RLS. O kill switch é por organização. Sem store ou sem campanhas,
+// o tick é no-op (nunca escreve dado fictício nem usa org default).
+//
+// NOTA pipeline real: o worker NÃO marca mais "contacted" nem registra
+// message.sent — ele só ENFILEIRA o trabalho (message_jobs 'queued') depois de
+// passar pelos gates honestos. Quem confirma entrega é a extensão, via
+// /messaging/report-sent (que avança a cadência de verdade).
+func (s *Server) processNextOutreachStep() {
+	if s.pgClient == nil || s.pgClient.Pool == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	orgIDs, err := s.listRunningOutreachOrgs(ctx)
+	if err != nil {
+		return
+	}
+	for _, orgID := range orgIDs {
+		s.processNextOutreachStepForOrg(ctx, orgID)
+	}
+}
+
+// listRunningOutreachOrgs devolve as orgs com campanha running. É uma leitura
+// administrativa pré-tenant (agregação cross-tenant só para agendar o trabalho;
+// cada passo executa depois sob RLS da própria org).
+func (s *Server) listRunningOutreachOrgs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := s.pgClient.Pool.Query(ctx, `
+		SELECT DISTINCT organization_id FROM campaigns WHERE status = 'running'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orgs []uuid.UUID
+	for rows.Next() {
+		var orgID uuid.UUID
+		if err := rows.Scan(&orgID); err != nil {
+			continue
+		}
+		orgs = append(orgs, orgID)
+	}
+	return orgs, rows.Err()
+}
+
+// outreachCandidate é um contato pronto para o próximo passo da cadência.
+type outreachCandidate struct {
+	ContactID   uuid.UUID
+	Position    int
+	FirstName   string
+	LastName    string
+	FullName    string
+	Company     string
+	JobTitle    string
+	LinkedInURL string
+}
+
+// ProcessOutreachStepForOrg expõe um tick do worker para uma org (usado pelos
+// testes E2E do pipeline; em produção o ticker de 4s chama o mesmo caminho).
+func (s *Server) ProcessOutreachStepForOrg(ctx context.Context, orgID uuid.UUID) {
+	if s.pgClient == nil || s.pgClient.Pool == nil {
+		return
+	}
+	s.processNextOutreachStepForOrg(ctx, orgID)
+}
+
+func (s *Server) processNextOutreachStepForOrg(ctx context.Context, orgID uuid.UUID) {
 	if s.safetyService.IsGlobalKillSwitchActive(orgID) {
 		return
 	}
 
-	// 1. Check for running campaigns
-	var runningCamp map[string]any
-	for _, c := range s.inMemory.campaigns {
-		if c["status"] == "running" {
-			runningCamp = c
-			break
+	// Passo executado numa transação com SET LOCAL app.organization_id: cada
+	// query enxerga só as linhas da própria org (policies *_tenant_isolation).
+	_ = s.pgClient.ExecWithTenant(ctx, orgID, func(tx pgx.Tx) error {
+		// GATE 1 — extensão viva (heartbeat <= 2 min). Sem device online nada
+		// é enfileirado: a cadência espera (contrato honesto — nunca "enviar"
+		// sem quem entregue).
+		var deviceOnline bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM extension_devices
+				WHERE organization_id = $1 AND status = 'active'
+				  AND last_seen_at > NOW() - INTERVAL '2 minutes'
+				  AND revoked_at IS NULL
+			)
+		`, orgID).Scan(&deviceOnline); err != nil || !deviceOnline {
+			return nil
 		}
-	}
-	if runningCamp == nil {
-		return
-	}
 
-	// 2. Find next waiting contact
-	var targetContact map[string]any
-	for _, contact := range s.inMemory.contacts {
-		st, _ := contact["status"].(string)
-		if st == "waiting" || st == "pending" {
-			targetContact = contact
-			break
+		// Campanha running mais recente com janela de execução aberta agora.
+		var campID uuid.UUID
+		var campName string
+		var dailyLimit int
+		var windowStart, windowEnd time.Time
+		var tz string
+		if err := tx.QueryRow(ctx, `
+			SELECT id, name, daily_limit, allowed_start_time, allowed_end_time, timezone
+			FROM campaigns
+			WHERE organization_id = $1 AND status = 'running'
+			ORDER BY updated_at DESC
+			LIMIT 1
+		`, orgID).Scan(&campID, &campName, &dailyLimit, &windowStart, &windowEnd, &tz); err != nil {
+			return nil // sem campanha running: tick no-op
 		}
+		if !withinExecutionWindow(windowStart, windowEnd, tz) {
+			return nil
+		}
+
+		// GATE 2 — limite diário + cooldown (Redis). Erro de Redis = não é
+		// possível respeitar o teto de segurança → não despacha neste tick.
+		if s.rateLimiter != nil {
+			ok, _, err := s.rateLimiter.CanExecuteAccount(ctx, orgID, dailyLimit)
+			if err != nil || !ok {
+				return nil
+			}
+		}
+
+		// Avança passos não-MESSAGE (delays/condições) até achar o próximo
+		// MESSAGE real ou esgotar a cadência do contato.
+		candidates := s.pickOutreachCandidates(ctx, tx, orgID, campID)
+		for _, cand := range candidates {
+			step, ok := s.currentMessageStep(ctx, tx, orgID, campID, cand)
+			if !ok {
+				continue // passo atual não é entregável; candidato reservado
+			}
+
+			// GATE 3 — renderização: variável faltando para o contato PARA a
+			// cadência dele (mesma regra do preview/piloto).
+			result := s.renderer.Render(step.templateBody, templates.ContactData{
+				FirstName: cand.FirstName,
+				LastName:  cand.LastName,
+				FullName:  cand.FullName,
+				Company:   cand.Company,
+				JobTitle:  cand.JobTitle,
+			})
+			if result.Error != nil || result.NeedsReview {
+				if _, err := tx.Exec(ctx, `
+					UPDATE campaign_contacts
+					SET status = 'stopped', stopped_at = NOW(), stop_reason = 'missing_variables', updated_at = NOW()
+					WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
+				`, orgID, campID, cand.ContactID); err != nil {
+					return err
+				}
+				continue
+			}
+
+			// Job idempotente (UNIQUE campaign|contact|step): duplicado = no-op.
+			sum := sha256.Sum256([]byte(campID.String() + "|" + cand.ContactID.String() + "|" + step.id.String()))
+			idemKey := hex.EncodeToString(sum[:])
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO message_jobs
+					(organization_id, campaign_id, contact_id, campaign_step_id, idempotency_key, rendered_content, status)
+				VALUES ($1, $2, $3, $4, $5, $6, 'queued')
+				ON CONFLICT DO NOTHING
+			`, orgID, campID, cand.ContactID, step.id, idemKey, result.RenderedText); err != nil {
+				return err
+			}
+
+			// Reserva o contato enquanto o job está em fila (não pega de novo).
+			if _, err := tx.Exec(ctx, `
+				UPDATE campaign_contacts
+				SET status = 'waiting', current_step_id = $4, updated_at = NOW()
+				WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
+			`, orgID, campID, cand.ContactID, step.id); err != nil {
+				return err
+			}
+
+			payload, _ := json.Marshal(map[string]any{
+				"contact_name": cand.FullName,
+				"company":      cand.Company,
+				"campaign":     campName,
+				"job_id":       idemKey,
+			})
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO events (organization_id, entity_type, entity_id, event_type, payload)
+				VALUES ($1, 'message', $2, 'message.queued', $3)
+			`, orgID, cand.ContactID, payload); err != nil {
+				return err
+			}
+
+			telemetry.GlobalMetrics.JobsProcessed.Add(1)
+			return nil // um despacho por org por tick
+		}
+		return nil
+	})
+}
+
+// stepRef identifica o passo MESSAGE atual de um candidato.
+type stepRef struct {
+	id          uuid.UUID
+	templateBody string
+}
+
+// pickOutreachCandidates devolve contatos pendentes da cadência cuja hora
+// chegou (next_execution_at nulo/vencido), ordenados por entrada.
+func (s *Server) pickOutreachCandidates(ctx context.Context, tx pgx.Tx, orgID, campID uuid.UUID) []outreachCandidate {
+	rows, err := tx.Query(ctx, `
+		SELECT cc.contact_id, cc.current_position,
+		       c.first_name, c.last_name, c.full_name, c.company, c.job_title, c.linkedin_url
+		FROM campaign_contacts cc
+		JOIN contacts c ON c.id = cc.contact_id AND c.organization_id = $1
+		WHERE cc.organization_id = $1 AND cc.campaign_id = $2
+		  AND cc.status IN ('pending', 'waiting')
+		  AND (cc.next_execution_at IS NULL OR cc.next_execution_at <= NOW())
+		ORDER BY cc.created_at ASC
+		LIMIT 10
+	`, orgID, campID)
+	if err != nil {
+		return nil
 	}
-	if targetContact == nil {
-		return
+	defer rows.Close()
+
+	out := make([]outreachCandidate, 0)
+	for rows.Next() {
+		var c outreachCandidate
+		if err := rows.Scan(&c.ContactID, &c.Position, &c.FirstName, &c.LastName, &c.FullName, &c.Company, &c.JobTitle, &c.LinkedInURL); err != nil {
+			continue
+		}
+		out = append(out, c)
+	}
+	_ = rows.Err()
+	return out
+}
+
+// currentMessageStep devolve o passo MESSAGE na posição atual do candidato e
+// faz o roteamento dos tipos não-entregáveis: sem passo na posição → cadência
+// completa; passo não-MESSAGE → aplica o delay dele e avança a posição.
+func (s *Server) currentMessageStep(ctx context.Context, tx pgx.Tx, orgID, campID uuid.UUID, cand outreachCandidate) (stepRef, bool) {
+	var stepType string
+	var step stepRef
+	var delayAmount int
+	var delayUnit string
+	err := tx.QueryRow(ctx, `
+		SELECT id, step_type, template_body, delay_amount, delay_unit
+		FROM campaign_steps
+		WHERE organization_id = $1 AND campaign_id = $2 AND position = $3
+	`, orgID, campID, cand.Position).Scan(&step.id, &stepType, &step.templateBody, &delayAmount, &delayUnit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Sem passo nessa posição: cadência terminou para o contato.
+		_, _ = tx.Exec(ctx, `
+			UPDATE campaign_contacts
+			SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+			WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
+		`, orgID, campID, cand.ContactID)
+		return stepRef{}, false
+	}
+	if err != nil {
+		return stepRef{}, false
+	}
+	if stepType == "MESSAGE" {
+		// Job já em fila para esse passo? Aí o contato está reservado — não
+		// pega de novo (evita duplicar despacho enquanto a extensão executa).
+		var exists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM message_jobs
+				WHERE organization_id = $1 AND campaign_id = $2
+				  AND contact_id = $3 AND campaign_step_id = $4
+				  AND status IN ('queued', 'sent')
+			)
+		`, orgID, campID, cand.ContactID, step.id).Scan(&exists); err != nil || exists {
+			return stepRef{}, false
+		}
+		return step, true
 	}
 
-	// 3. Mark contact as contacted
-	targetContact["status"] = "contacted"
-	targetContact["last_contacted_at"] = time.Now()
-
-	contactName, _ := targetContact["full_name"].(string)
-	if contactName == "" {
-		fn, _ := targetContact["first_name"].(string)
-		ln, _ := targetContact["last_name"].(string)
-		contactName = strings.TrimSpace(fn + " " + ln)
+	// Passo não-MESSAGE (ex.: WAIT/CONNECT): aplica o delay e avança posição;
+	// o contato volta a ser elegível no próximo tick.
+	next := cand.Position + 1
+	if _, err := tx.Exec(ctx, `
+		UPDATE campaign_contacts
+		SET current_position = $4, next_execution_at = NOW() + make_interval(
+			years => 0, months => 0, days => CASE WHEN $5 = 'days' THEN $6 ELSE 0 END,
+			weeks => 0, hours => CASE WHEN $5 = 'hours' THEN $6 ELSE 0 END,
+			mins => CASE WHEN $5 = 'minutes' THEN $6 ELSE 0 END
+		), updated_at = NOW()
+		WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
+	`, orgID, campID, cand.ContactID, next, delayUnit, delayAmount); err != nil {
+		return stepRef{}, false
 	}
-	company, _ := targetContact["company"].(string)
-	campName, _ := runningCamp["name"].(string)
+	return stepRef{}, false
+}
 
-	telemetry.GlobalMetrics.JobsProcessed.Add(1)
-
-	// 4. Record to activity stream
-	activityItem := map[string]any{
-		"id":          uuid.New().String(),
-		"entity_type": "message",
-		"entity_id":   targetContact["id"],
-		"event_type":  "message.sent",
-		"description": fmt.Sprintf("Mensagem de outreach enviada para %s (%s) — Campanha: %s", contactName, company, campName),
-		"payload": map[string]any{
-			"contact_name": contactName,
-			"company":      company,
-			"campaign":     campName,
-		},
-		"created_at": time.Now(),
+// withinExecutionWindow respeita allowed_start/end no timezone da campanha.
+func withinExecutionWindow(start, end time.Time, tz string) bool {
+	loc, err := time.LoadLocation(tz)
+	if err != nil || loc == nil {
+		loc = time.UTC
 	}
-	s.inMemory.activity = append([]map[string]any{activityItem}, s.inMemory.activity...)
-	if len(s.inMemory.activity) > 50 {
-		s.inMemory.activity = s.inMemory.activity[:50]
+	now := time.Now().In(loc)
+	s := time.Date(now.Year(), now.Month(), now.Day(), start.Hour(), start.Minute(), 0, 0, loc)
+	e := time.Date(now.Year(), now.Month(), now.Day(), end.Hour(), end.Minute(), 59, 0, loc)
+	if e.Before(s) { // janela atravessando a meia-noite
+		return now.After(s) || now.Before(e)
 	}
-
-	// 5. Publish real-time event to SSE
-	s.broker.Publish(orgID, "message.sent", activityItem)
+	return !now.Before(s) && !now.After(e)
 }
 
 func (s *Server) HandleListTemplates(w http.ResponseWriter, r *http.Request) {
+	// Templates: mistura honesta de sistema (is_system_template, visíveis a
+	// todos — sem organization_id) + os do próprio tenant (RLS). Token fixo
+	// removido: o id do template de sistema é um UUID estável documentado.
 	tpls := []map[string]any{
 		{
-			"id":                 uuid.New(),
+			"id":                 "00000000-0000-0000-0000-000000000001",
 			"name":               "VibexCorp Standard Outreach",
 			"description":        "Fluxo padrão de 3 etapas com verificação de Stop on Reply.",
 			"is_system_template": true,
 		},
 	}
+
+	if orgID, _, ok := requireTenant(r); ok && s.pgClient != nil && s.pgClient.Pool != nil {
+		_ = s.pgClient.ExecWithTenant(r.Context(), orgID, func(tx pgx.Tx) error {
+			rows, err := tx.Query(r.Context(), `
+				SELECT id, name, description, is_system_template
+				FROM flow_templates
+				ORDER BY created_at ASC
+			`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id uuid.UUID
+				var name, desc string
+				var isSys bool
+				if err := rows.Scan(&id, &name, &desc, &isSys); err != nil {
+					continue
+				}
+				tpls = append(tpls, map[string]any{
+					"id":                 id,
+					"name":               name,
+					"description":        desc,
+					"is_system_template": isSys,
+				})
+			}
+			return rows.Err()
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"templates": tpls})
 }
 
@@ -1538,86 +2282,111 @@ func (s *Server) HandleReady(w http.ResponseWriter, r *http.Request) {
 
 // --- Apollo-Style Messaging, Outreach & Inbox Handlers ---
 
-func (s *Server) HandleDemoToken(w http.ResponseWriter, r *http.Request) {
-	token, _ := s.authService.GenerateToken(
-		uuid.MustParse("00000000-0000-0000-0000-000000000002"),
-		uuid.MustParse("00000000-0000-0000-0000-000000000001"),
-		"admin@vibexcorp.com",
-		"owner",
-	)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"token":       token,
-		"status":      "authorized",
-		"device_name": "Chrome Extension (1-Click Local)",
-	})
-}
+// NOTA Fase D: HandleDemoToken removido — era um emissor de JWT de owner sem
+// credencial (qualquer POST ganhava token). A extensão usa pareamento por
+// código + token_hash; o dashboard usa /auth/login com bcrypt.
 
 func (s *Server) HandleGetPendingOutreach(w http.ResponseWriter, r *http.Request) {
-	s.inMemory.mu.RLock()
-	defer s.inMemory.mu.RUnlock()
-
-	var camp map[string]any
-	for _, c := range s.inMemory.campaigns {
-		if c["status"] == "running" {
-			camp = c
-			break
-		}
-	}
-	if camp == nil && len(s.inMemory.campaigns) > 0 {
-		camp = s.inMemory.campaigns[0]
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
-	campName := "Campanha de Prospecção LinkedIn B2B"
-	campID := "camp-001"
-	template := "Olá {{first_name}}, vi que você atua na {{company}}. Gostaria de conectar para trocarmos ideias sobre automação B2B!"
-	if camp != nil {
-		if name, ok := camp["name"].(string); ok && name != "" {
-			campName = name
-		}
-		if id, ok := camp["id"].(uuid.UUID); ok {
-			campID = id.String()
-		}
+	// Trabalho REAL enfileirado pelo worker: um job 'queued' por vez, com a
+	// fila restante e o saldo diário. Sem campanha/jobs → vazio honesto
+	// (nunca camp-001 fictícia, nunca template cru com {{}}).
+	type queuedJob struct {
+		jobID, campaignID, campaignName string
+		queueRemaining                  int
+		contactID                       uuid.UUID
+		first, last, full, comp, title  string
+		url, rendered                   string
 	}
 
-	pendingContacts := make([]map[string]any, 0)
-	for _, contact := range s.inMemory.contacts {
-		st, _ := contact["status"].(string)
-		if st == "waiting" || st == "pending" {
-			fn, _ := contact["first_name"].(string)
-			if fn == "" {
-				fn = "Colega"
+	var job *queuedJob
+	var dailyRemaining int
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(r.Context(), `
+			SELECT j.id, j.campaign_id, c.name, j.contact_id,
+			       ct.first_name, ct.last_name, ct.full_name, ct.company, ct.job_title, ct.linkedin_url,
+			       j.rendered_content
+			FROM message_jobs j
+			JOIN campaigns c ON c.id = j.campaign_id AND c.organization_id = $1 AND c.status = 'running'
+			JOIN contacts ct ON ct.id = j.contact_id AND ct.organization_id = $1
+			WHERE j.organization_id = $1 AND j.status = 'queued'
+			ORDER BY j.created_at ASC
+			LIMIT 1
+		`, orgID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			j := &queuedJob{}
+			if err := rows.Scan(&j.jobID, &j.campaignID, &j.campaignName, &j.contactID,
+				&j.first, &j.last, &j.full, &j.comp, &j.title, &j.url, &j.rendered); err != nil {
+				continue
 			}
-			comp, _ := contact["company"].(string)
-			if comp == "" {
-				comp = "sua empresa"
-			}
-			job, _ := contact["job_title"].(string)
+			job = j
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
 
-			// Render message variables
-			rendered := strings.ReplaceAll(template, "{{first_name}}", fn)
-			rendered = strings.ReplaceAll(rendered, "{{company}}", comp)
-			rendered = strings.ReplaceAll(rendered, "{{job_title}}", job)
+		// queueRemaining num local: com fila vazia, job é nil — dereferenciar
+		// job.queueRemaining aqui causava panic (500 vazio) no caminho honesto
+		// de "nenhum trabalho pendente".
+		var queueRemaining int
+		if err := tx.QueryRow(r.Context(), `
+			SELECT COUNT(*) FROM message_jobs
+			WHERE organization_id = $1 AND status = 'queued'
+		`, orgID).Scan(&queueRemaining); err != nil {
+			return err
+		}
+		if job != nil {
+			job.queueRemaining = queueRemaining
+		}
+		return nil
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
 
-			pendingContacts = append(pendingContacts, map[string]any{
-				"id":               contact["id"],
-				"first_name":       contact["first_name"],
-				"last_name":        contact["last_name"],
-				"full_name":        contact["full_name"],
-				"company":          contact["company"],
-				"job_title":        contact["job_title"],
-				"linkedin_url":     contact["linkedin_url"],
-				"rendered_message": rendered,
-			})
+	dailyRemaining = -1 // desconhecido sem Redis (worker segue com gates locais)
+	if s.rateLimiter != nil {
+		// O teto diário fica na campanha; para o payload o valor relativo ao
+		// teto do servidor já dá a noção de saldo restante do dia.
+		if rem, err := s.rateLimiter.RemainingToday(r.Context(), orgID, ratelimit.ServerMaxDailyLimit); err == nil {
+			dailyRemaining = rem
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"campaign_id":   campID,
-		"campaign_name": campName,
-		"template":      template,
-		"total_pending": len(pendingContacts),
-		"contacts":      pendingContacts,
-	})
+	payload := map[string]any{
+		"has_campaign":    job != nil,
+		"campaign_id":     "",
+		"campaign_name":   "",
+		"queue_remaining": 0,
+		"daily_remaining": dailyRemaining,
+		"job":             nil,
+	}
+	if job != nil {
+		payload["campaign_id"] = job.campaignID
+		payload["campaign_name"] = job.campaignName
+		payload["queue_remaining"] = job.queueRemaining
+		payload["job"] = map[string]any{
+			"job_id":           job.jobID,
+			"contact_id":       job.contactID,
+			"first_name":       job.first,
+			"last_name":        job.last,
+			"full_name":        job.full,
+			"company":          job.comp,
+			"job_title":        job.title,
+			"linkedin_url":     job.url,
+			"rendered_message": job.rendered,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, payload)
 }
 
 type ReportSentRequest struct {
@@ -1626,13 +2395,14 @@ type ReportSentRequest struct {
 	MessageBody   string `json:"message_body"`
 	LinkedInURL   string `json:"linkedin_url"`
 	Status        string `json:"status"`
+	JobID         string `json:"job_id"` // job enfileirado pelo worker (pipeline real)
+	Error         string `json:"error"`  // não vazio = falha na entrega → retry
 }
 
 func (s *Server) HandleReportSentMessage(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
 	var req ReportSentRequest
@@ -1641,110 +2411,139 @@ func (s *Server) HandleReportSentMessage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s.inMemory.mu.Lock()
-	var matchedContact map[string]any
-	for _, c := range s.inMemory.contacts {
-		cid := ""
-		if id, ok := c["id"].(uuid.UUID); ok {
-			cid = id.String()
-		} else if idStr, ok := c["id"].(string); ok {
-			cid = idStr
-		}
-		if cid == req.ContactID || (req.LinkedInURL != "" && c["linkedin_url"] == req.LinkedInURL) {
-			matchedContact = c
-			break
-		}
+	// Caminho do pipeline real: a extensão reporta contra o job enfileirado
+	// pelo worker. Com erro → retry com backoff (attempts), 3 tentativas e a
+	// cadência do contato para com motivo honesto.
+	if req.JobID != "" {
+		s.handleJobReportSent(w, r, orgID, req)
+		return
 	}
 
-	company := "LinkedIn"
-	recipient := req.RecipientName
-	if matchedContact != nil {
-		matchedContact["status"] = "contacted"
-		matchedContact["last_contacted_at"] = time.Now()
-		matchedContact["last_message"] = req.MessageBody
-		if comp, ok := matchedContact["company"].(string); ok && comp != "" {
-			company = comp
+	if strings.TrimSpace(req.MessageBody) == "" {
+		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "message_body is required", nil)
+		return
+	}
+
+	// Resolve o contato do próprio tenant por id ou linkedin_url; contato de
+	// outro tenant não existe para este orgID (RLS) → 404 honesto.
+	var contactID uuid.UUID
+	byURL := req.ContactID == "" && req.LinkedInURL != ""
+	if cid, err := uuid.Parse(req.ContactID); err == nil {
+		contactID = cid
+	}
+	if byURL {
+		if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+			err := tx.QueryRow(r.Context(), `
+				SELECT id FROM contacts
+				WHERE organization_id = $1 AND linkedin_url = $2
+			`, orgID, req.LinkedInURL).Scan(&contactID)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return errContactNotFound
+				}
+				return err
+			}
+			return nil
+		}) {
+			if errors.Is(tenantTxErr, errContactNotFound) {
+				writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact not found", nil)
+				return
+			}
+			return // 503 STORE_UNAVAILABLE já respondido pelo helper
 		}
+		if contactID == uuid.Nil {
+			writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact not found", nil)
+			return
+		}
+	} else if contactID == uuid.Nil {
+		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "contact_id or linkedin_url is required", nil)
+		return
+	}
+
+	var (
+		recipient, company string
+		convID             uuid.UUID
+	)
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		// 1. Contato pertence ao tenant? (UPDATE ... WHERE org+id; 0 linhas = 404)
+		var fullName, comp string
+		err := tx.QueryRow(r.Context(), `
+			UPDATE contacts
+			SET status = 'contacted', updated_at = NOW()
+			WHERE organization_id = $1 AND id = $2
+			RETURNING full_name, company
+		`, orgID, contactID).Scan(&fullName, &comp)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errContactNotFound
+			}
+			return err
+		}
+		recipient = req.RecipientName
 		if recipient == "" {
-			if fn, ok := matchedContact["full_name"].(string); ok && fn != "" {
-				recipient = fn
+			recipient = fullName
+		}
+		company = comp
+		if company == "" {
+			company = "LinkedIn"
+		}
+
+		// 2. Conversa do tenant para o contato (cria se não existir).
+		err = tx.QueryRow(r.Context(), `
+			SELECT id FROM conversations
+			WHERE organization_id = $1 AND contact_id = $2
+		`, orgID, contactID).Scan(&convID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if convID == uuid.Nil {
+			err = tx.QueryRow(r.Context(), `
+				INSERT INTO conversations (organization_id, contact_id, status)
+				VALUES ($1, $2, 'open')
+				RETURNING id
+			`, orgID, contactID).Scan(&convID)
+			if err != nil {
+				return err
 			}
 		}
-	}
 
-	if recipient == "" {
-		recipient = "Conexão LinkedIn"
-	}
-
-	// Update/Create Conversation for Inbox
-	convID := req.ContactID
-	if convID == "" {
-		convID = uuid.New().String()
-	}
-	nowStr := time.Now().Format("15:04")
-
-	var targetConv map[string]any
-	for _, conv := range s.inMemory.conversations {
-		if conv["id"] == convID || conv["leadName"] == recipient {
-			targetConv = conv
-			break
+		// 3. Mensagem outbound + evento de auditoria, tudo na transação.
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO messages (organization_id, conversation_id, direction, content)
+			VALUES ($1, $2, 'outbound', $3)
+		`, orgID, convID, req.MessageBody); err != nil {
+			return err
 		}
-	}
-
-	outboundMsg := map[string]any{
-		"id":        uuid.New().String(),
-		"direction": "outbound",
-		"content":   req.MessageBody,
-		"sentAt":    nowStr,
-		"stepTag":   "Step 1 (Outreach Extensão)",
-	}
-
-	if targetConv == nil {
-		targetConv = map[string]any{
-			"id":              convID,
-			"leadName":        recipient,
-			"company":         company,
-			"jobTitle":        "Conexão de 1º Grau",
-			"linkedinUrl":     req.LinkedInURL,
-			"lastMessage":     req.MessageBody,
-			"lastMessageTime": nowStr,
-			"status":          "open",
-			"hasReplied":      false,
-			"messages":        []map[string]any{outboundMsg},
+		payload, _ := json.Marshal(map[string]any{
+			"contact_name": recipient,
+			"company":      company,
+			"message_body": req.MessageBody,
+			"sent_via":     "extension",
+		})
+		_, err = tx.Exec(r.Context(), `
+			INSERT INTO events (organization_id, entity_type, entity_id, event_type, payload)
+			VALUES ($1, 'message', $2, 'message.sent', $3)
+		`, orgID, convID, payload)
+		return err
+	}) {
+		if errors.Is(tenantTxErr, errContactNotFound) {
+			writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact not found", nil)
+			return
 		}
-		s.inMemory.conversations = append([]map[string]any{targetConv}, s.inMemory.conversations...)
-	} else {
-		targetConv["lastMessage"] = req.MessageBody
-		targetConv["lastMessageTime"] = nowStr
-		if msgs, ok := targetConv["messages"].([]map[string]any); ok {
-			targetConv["messages"] = append(msgs, outboundMsg)
-		}
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
-	// Record Activity Item
+	telemetry.GlobalMetrics.JobsProcessed.Add(1)
+
 	activityItem := map[string]any{
 		"id":          uuid.New().String(),
 		"entity_type": "message",
 		"entity_id":   convID,
 		"event_type":  "message.sent",
 		"description": fmt.Sprintf("Mensagem enviada via Extensão no LinkedIn para %s (%s)", recipient, company),
-		"payload": map[string]any{
-			"contact_name": recipient,
-			"company":      company,
-			"message_body": req.MessageBody,
-			"sent_via":     "extension_apollo_mode",
-		},
-		"created_at": time.Now(),
+		"created_at":  time.Now(),
 	}
-	s.inMemory.activity = append([]map[string]any{activityItem}, s.inMemory.activity...)
-	if len(s.inMemory.activity) > 50 {
-		s.inMemory.activity = s.inMemory.activity[:50]
-	}
-
-	telemetry.GlobalMetrics.JobsProcessed.Add(1)
-	s.inMemory.mu.Unlock()
-
-	// Realtime SSE broadcast
 	s.broker.Publish(orgID, "message.sent", activityItem)
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -1754,6 +2553,247 @@ func (s *Server) HandleReportSentMessage(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// handleJobReportSent processa o relato da extensão sobre um job enfileirado
+// pelo worker: sucesso confirma a entrega real (job 'sent', contato
+// 'contacted', conversa + mensagem outbound, evento de auditoria) e avança a
+// cadência com o delay do passo; falha incrementa attempts — 3 tentativas
+// param a cadência do contato com stop_reason honesto.
+func (s *Server) handleJobReportSent(w http.ResponseWriter, r *http.Request, orgID uuid.UUID, req ReportSentRequest) {
+	jobID, err := uuid.Parse(req.JobID)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "job_id is invalid", nil)
+		return
+	}
+
+	type jobAdvance struct {
+		campID, contactID, convID uuid.UUID
+		position, delayAmount     int
+		delayUnit                 string
+		recipient, company        string
+	}
+	var adv jobAdvance
+	failed := strings.TrimSpace(req.Error) != ""
+
+	var outcome string
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		// 1. Job do tenant (RLS): job de outra org não existe → 404 honesto.
+		var status string
+		var attempts int
+		if err := tx.QueryRow(r.Context(), `
+			SELECT status, attempts, campaign_id, contact_id
+			FROM message_jobs WHERE organization_id = $1 AND id = $2
+		`, orgID, jobID).Scan(&status, &attempts, &adv.campID, &adv.contactID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errContactNotFound
+			}
+			return err
+		}
+
+		if failed {
+			attempts++
+			if attempts >= 3 {
+				if _, err := tx.Exec(r.Context(), `
+					UPDATE message_jobs
+					SET status = 'failed', attempts = $3, error_type = 'delivery', error_message = $4, updated_at = NOW()
+					WHERE organization_id = $1 AND id = $2
+				`, orgID, jobID, attempts, truncateErrText(req.Error)); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(r.Context(), `
+					UPDATE campaign_contacts
+					SET status = 'stopped', stopped_at = NOW(), stop_reason = 'delivery_failed', updated_at = NOW()
+					WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
+				`, orgID, adv.campID, adv.contactID); err != nil {
+					return err
+				}
+				s.recordEventTx(tx, orgID, adv.contactID, "message.failed", map[string]any{
+					"job_id": req.JobID, "error": truncateErrText(req.Error), "final": true,
+				})
+				outcome = "failed_stopped"
+				return nil
+			}
+			if _, err := tx.Exec(r.Context(), `
+				UPDATE message_jobs
+				SET attempts = $3, error_type = 'delivery', error_message = $4, updated_at = NOW()
+				WHERE organization_id = $1 AND id = $2 AND status = 'queued'
+			`, orgID, jobID, attempts, truncateErrText(req.Error)); err != nil {
+				return err
+			}
+			s.recordEventTx(tx, orgID, adv.contactID, "message.failed", map[string]any{
+				"job_id": req.JobID, "error": truncateErrText(req.Error), "attempts": attempts,
+			})
+			outcome = "retry_scheduled"
+			return nil
+		}
+
+		// Idempotente: entrega já confirmada antes não duplica registro.
+		if status == "sent" {
+			outcome = "already_recorded"
+			return nil
+		}
+
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE message_jobs
+			SET status = 'sent', executed_at = NOW(), updated_at = NOW()
+			WHERE organization_id = $1 AND id = $2
+		`, orgID, jobID); err != nil {
+			return err
+		}
+
+		// 2. Contato do tenant vira 'contacted' (0 linhas = dado de outra org).
+		var fullName, comp, rendered string
+		if err := tx.QueryRow(r.Context(), `
+			UPDATE contacts
+			SET status = 'contacted', updated_at = NOW()
+			WHERE organization_id = $1 AND id = $2
+			RETURNING full_name, company
+		`, orgID, adv.contactID).Scan(&fullName, &comp); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errContactNotFound
+			}
+			return err
+		}
+		adv.recipient = req.RecipientName
+		if adv.recipient == "" {
+			adv.recipient = fullName
+		}
+		adv.company = comp
+		if adv.company == "" {
+			adv.company = "LinkedIn"
+		}
+
+		// 3. Conversa + mensagem outbound (mesma semântica do caminho manual).
+		if err := tx.QueryRow(r.Context(), `
+			SELECT id FROM conversations WHERE organization_id = $1 AND contact_id = $2
+		`, orgID, adv.contactID).Scan(&adv.convID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if adv.convID == uuid.Nil {
+			if err := tx.QueryRow(r.Context(), `
+				INSERT INTO conversations (organization_id, contact_id, status)
+				VALUES ($1, $2, 'open')
+				RETURNING id
+			`, orgID, adv.contactID).Scan(&adv.convID); err != nil {
+				return err
+			}
+		}
+		if err := tx.QueryRow(r.Context(), `
+			SELECT rendered_content FROM message_jobs WHERE organization_id = $1 AND id = $2
+		`, orgID, jobID).Scan(&rendered); err != nil {
+			return err
+		}
+		if req.MessageBody != "" {
+			rendered = req.MessageBody
+		}
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO messages (organization_id, conversation_id, direction, content)
+			VALUES ($1, $2, 'outbound', $3)
+		`, orgID, adv.convID, rendered); err != nil {
+			return err
+		}
+		s.recordEventTx(tx, orgID, adv.convID, "message.sent", map[string]any{
+			"contact_name": adv.recipient,
+			"company":      adv.company,
+			"job_id":       req.JobID,
+			"sent_via":     "extension",
+		})
+
+		// 4. Avança a cadência: próximo passo com o delay do passo atual,
+		// ou cadência completa se este era o último.
+		if err := tx.QueryRow(r.Context(), `
+			SELECT cc.current_position, COALESCE(cs.delay_amount, 0), COALESCE(cs.delay_unit, 'days')
+			FROM campaign_contacts cc
+			LEFT JOIN campaign_steps cs ON cs.campaign_id = cc.campaign_id AND cs.position = cc.current_position
+			WHERE cc.organization_id = $1 AND cc.campaign_id = $2 AND cc.contact_id = $3
+		`, orgID, adv.campID, adv.contactID).Scan(&adv.position, &adv.delayAmount, &adv.delayUnit); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		var nextStepID uuid.UUID
+		err := tx.QueryRow(r.Context(), `
+			SELECT id FROM campaign_steps
+			WHERE organization_id = $1 AND campaign_id = $2 AND position = $3
+		`, orgID, adv.campID, adv.position+1).Scan(&nextStepID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			_, err = tx.Exec(r.Context(), `
+				UPDATE campaign_contacts
+				SET status = 'completed', completed_at = NOW(), current_step_id = NULL, next_execution_at = NULL, updated_at = NOW()
+				WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
+			`, orgID, adv.campID, adv.contactID)
+			return err
+		}
+		_, err = tx.Exec(r.Context(), `
+			UPDATE campaign_contacts
+			SET status = 'waiting', current_position = $4, current_step_id = $5, next_execution_at = NOW() + make_interval(
+				years => 0, months => 0, days => CASE WHEN $6 = 'days' THEN $7 ELSE 0 END,
+				weeks => 0, hours => CASE WHEN $6 = 'hours' THEN $7 ELSE 0 END,
+				mins => CASE WHEN $6 = 'minutes' THEN $7 ELSE 0 END
+			), updated_at = NOW()
+			WHERE organization_id = $1 AND campaign_id = $2 AND contact_id = $3
+		`, orgID, adv.campID, adv.contactID, adv.position+1, nextStepID, adv.delayUnit, adv.delayAmount)
+		return err
+	}) {
+		if errors.Is(tenantTxErr, errContactNotFound) {
+			writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact or job not found", nil)
+			return
+		}
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
+	switch outcome {
+	case "retry_scheduled", "failed_stopped":
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  outcome,
+			"job_id":  req.JobID,
+			"message": "delivery failure recorded; cadence updated accordingly",
+		})
+		return
+	}
+
+	if outcome != "already_recorded" {
+		if s.rateLimiter != nil {
+			_ = s.rateLimiter.RecordExecution(r.Context(), orgID)
+		}
+		telemetry.GlobalMetrics.JobsProcessed.Add(1)
+		s.broker.Publish(orgID, "message.sent", map[string]any{
+			"id":          uuid.New().String(),
+			"entity_type": "message",
+			"entity_id":   adv.convID,
+			"event_type":  "message.sent",
+			"description": fmt.Sprintf("Mensagem enviada via Extensão no LinkedIn para %s (%s)", adv.recipient, adv.company),
+			"created_at":  time.Now(),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "recorded",
+		"message":    "sent message reported and recorded successfully",
+		"job_id":     req.JobID,
+		"contact_id": adv.convID,
+	})
+}
+
+// recordEventTx grava evento de auditoria dentro da transação com tenant.
+func (s *Server) recordEventTx(tx pgx.Tx, orgID, entityID uuid.UUID, eventType string, fields map[string]any) {
+	payload, _ := json.Marshal(fields)
+	_, _ = tx.Exec(context.Background(), `
+		INSERT INTO events (organization_id, entity_type, entity_id, event_type, payload)
+		VALUES ($1, 'message', $2, $3, $4)
+	`, orgID, entityID, eventType, payload)
+}
+
+func truncateErrText(s string) string {
+	if len(s) > 500 {
+		return s[:500]
+	}
+	return s
+}
+
 type ReportReplyRequest struct {
 	ContactID     string `json:"contact_id"`
 	RecipientName string `json:"recipient_name"`
@@ -1761,85 +2801,317 @@ type ReportReplyRequest struct {
 }
 
 func (s *Server) HandleReportReply(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.GetClaims(r.Context())
-	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	if claims != nil && claims.OrganizationID != uuid.Nil {
-		orgID = claims.OrganizationID
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
 
 	var req ReportReplyRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-
-	s.inMemory.mu.Lock()
-	for _, c := range s.inMemory.contacts {
-		cid := ""
-		if id, ok := c["id"].(uuid.UUID); ok {
-			cid = id.String()
-		} else if idStr, ok := c["id"].(string); ok {
-			cid = idStr
-		}
-		if cid == req.ContactID || c["full_name"] == req.RecipientName {
-			c["status"] = "replied"
-			break
-		}
+	if strings.TrimSpace(req.ReplyBody) == "" {
+		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "reply_body is required", nil)
+		return
 	}
 
-	nowStr := time.Now().Format("15:04")
-	for _, conv := range s.inMemory.conversations {
-		if conv["id"] == req.ContactID || conv["leadName"] == req.RecipientName {
-			conv["status"] = "replied"
-			conv["hasReplied"] = true
-			conv["lastMessage"] = req.ReplyBody
-			conv["lastMessageTime"] = nowStr
-			if msgs, ok := conv["messages"].([]map[string]any); ok {
-				conv["messages"] = append(msgs, map[string]any{
-					"id":        uuid.New().String(),
-					"direction": "inbound",
-					"content":   req.ReplyBody,
-					"sentAt":    nowStr,
-					"stepTag":   "Resposta LinkedIn (Stop on Reply)",
-				})
+	// Resolve o contato do próprio tenant por id ou nome; contato de outro
+	// tenant não existe para este orgID (RLS) → 404 honesto.
+	var contactID uuid.UUID
+	if cid, err := uuid.Parse(req.ContactID); err == nil {
+		contactID = cid
+	}
+	if contactID == uuid.Nil && req.RecipientName != "" {
+		if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+			err := tx.QueryRow(r.Context(), `
+				SELECT id FROM contacts
+				WHERE organization_id = $1 AND full_name = $2
+				ORDER BY updated_at DESC
+				LIMIT 1
+			`, orgID, req.RecipientName).Scan(&contactID)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return errContactNotFound
+				}
+				return err
 			}
-			break
+			return nil
+		}) {
+			if errors.Is(tenantTxErr, errContactNotFound) {
+				writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact not found", nil)
+				return
+			}
+			return // 503 STORE_UNAVAILABLE já respondido pelo helper
 		}
+	}
+	if contactID == uuid.Nil {
+		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "contact_id or recipient_name is required", nil)
+		return
+	}
+
+	var recipient string
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		// 1. Marca replied + Stop on Reply: contato do tenant vira replied e
+		// os follow-ups pendentes da cadência são cancelados na transação.
+		var fullName string
+		err := tx.QueryRow(r.Context(), `
+			UPDATE contacts
+			SET status = 'replied', updated_at = NOW()
+			WHERE organization_id = $1 AND id = $2
+			RETURNING full_name
+		`, orgID, contactID).Scan(&fullName)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errContactNotFound
+			}
+			return err
+		}
+		recipient = fullName
+
+		if _, err := tx.Exec(r.Context(), `
+			UPDATE campaign_contacts
+			SET status = 'stopped', stop_reason = 'stop_on_reply', stopped_at = NOW(), updated_at = NOW()
+			WHERE organization_id = $1 AND contact_id = $2
+			  AND status IN ('pending', 'waiting', 'active')
+		`, orgID, contactID); err != nil {
+			return err
+		}
+
+		// 2. Conversa do tenant: marca replied e grava a inbound.
+		var convID uuid.UUID
+		err = tx.QueryRow(r.Context(), `
+			SELECT id FROM conversations
+			WHERE organization_id = $1 AND contact_id = $2
+		`, orgID, contactID).Scan(&convID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if convID == uuid.Nil {
+			err = tx.QueryRow(r.Context(), `
+				INSERT INTO conversations (organization_id, contact_id, status)
+				VALUES ($1, $2, 'replied')
+				RETURNING id
+			`, orgID, contactID).Scan(&convID)
+			if err != nil {
+				return err
+			}
+		} else if _, err := tx.Exec(r.Context(), `
+			UPDATE conversations SET status = 'replied', updated_at = NOW()
+			WHERE organization_id = $1 AND id = $2
+		`, orgID, convID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO messages (organization_id, conversation_id, direction, content)
+			VALUES ($1, $2, 'inbound', $3)
+		`, orgID, convID, req.ReplyBody); err != nil {
+			return err
+		}
+
+		// 3. Evento de auditoria reply.detected na mesma transação.
+		payload, _ := json.Marshal(map[string]any{
+			"recipient_name": recipient,
+			"reply_body":     req.ReplyBody,
+		})
+		_, err = tx.Exec(r.Context(), `
+			INSERT INTO events (organization_id, entity_type, entity_id, event_type, payload)
+			VALUES ($1, 'message', $2, 'reply.detected', $3)
+		`, orgID, convID, payload)
+		return err
+	}) {
+		if errors.Is(tenantTxErr, errContactNotFound) {
+			writeAPIError(w, http.StatusNotFound, "CONTACT_NOT_FOUND", "contact not found", nil)
+			return
+		}
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
 	}
 
 	activityItem := map[string]any{
 		"id":          uuid.New().String(),
 		"entity_type": "message",
-		"entity_id":   req.ContactID,
+		"entity_id":   contactID,
 		"event_type":  "reply.detected",
-		"description": fmt.Sprintf("Resposta detectada no LinkedIn de %s — Follow-ups cancelados (Stop on Reply)", req.RecipientName),
+		"description": fmt.Sprintf("Resposta detectada no LinkedIn de %s — Follow-ups cancelados (Stop on Reply)", recipient),
 		"created_at":  time.Now(),
 	}
-	s.inMemory.activity = append([]map[string]any{activityItem}, s.inMemory.activity...)
-	s.inMemory.mu.Unlock()
 
 	s.broker.Publish(orgID, "reply.detected", activityItem)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "reply_recorded", "stop_on_reply": true})
 }
 
 func (s *Server) HandleListConversations(w http.ResponseWriter, r *http.Request) {
-	s.inMemory.mu.RLock()
-	defer s.inMemory.mu.RUnlock()
-
-	list := s.inMemory.conversations
-	if list == nil {
-		list = []map[string]any{}
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
+
+	// Conversas do próprio tenant com última mensagem (RLS); sem conversa =
+	// lista vazia honesta, nunca dado de outro tenant.
+	type convRow struct {
+		id, contactID, status  string
+		leadName, company      string
+		jobTitle, linkedinURL string
+		lastMsg, lastTime      string
+		hasReplied             bool
+	}
+	rows := make([]convRow, 0)
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		qrows, err := tx.Query(r.Context(), `
+			SELECT conv.id, conv.contact_id, conv.status,
+			       c.full_name, COALESCE(c.company, ''), COALESCE(c.job_title, ''),
+			       COALESCE(c.linkedin_url, ''),
+			       COALESCE((SELECT m.content FROM messages m
+			                 WHERE m.organization_id = $1 AND m.conversation_id = conv.id
+			                 ORDER BY m.sent_at DESC LIMIT 1), ''),
+			       COALESCE((SELECT TO_CHAR(m.sent_at, 'HH24:MI') FROM messages m
+			                 WHERE m.organization_id = $1 AND m.conversation_id = conv.id
+			                 ORDER BY m.sent_at DESC LIMIT 1), ''),
+			       EXISTS(SELECT 1 FROM messages m
+			              WHERE m.organization_id = $1 AND m.conversation_id = conv.id
+			              AND m.direction = 'inbound')
+			FROM conversations conv
+			JOIN contacts c ON c.id = conv.contact_id AND c.organization_id = $1
+			WHERE conv.organization_id = $1
+			ORDER BY conv.updated_at DESC
+			LIMIT 200
+		`, orgID)
+		if err != nil {
+			return err
+		}
+		defer qrows.Close()
+		for qrows.Next() {
+			var row convRow
+			var cid, coid uuid.UUID
+			if err := qrows.Scan(&cid, &coid, &row.status, &row.leadName,
+				&row.company, &row.jobTitle, &row.linkedinURL,
+				&row.lastMsg, &row.lastTime, &row.hasReplied); err != nil {
+				continue
+			}
+			row.id, row.contactID = cid.String(), coid.String()
+			rows = append(rows, row)
+		}
+		return qrows.Err()
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
+	list := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		status := row.status
+		if status != "replied" && status != "archived" {
+			status = "open"
+		}
+		list = append(list, map[string]any{
+			"id":              row.id,
+			"contact_id":      row.contactID,
+			"leadName":        row.leadName,
+			"company":         row.company,
+			"jobTitle":        row.jobTitle,
+			"linkedinUrl":     row.linkedinURL,
+			"lastMessage":     row.lastMsg,
+			"lastMessageTime": row.lastTime,
+			"status":          status,
+			"hasReplied":      row.hasReplied,
+			"messages":        []map[string]any{},
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"conversations": list, "total": len(list)})
 }
 
 func (s *Server) HandleGetConversation(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	s.inMemory.mu.RLock()
-	defer s.inMemory.mu.RUnlock()
-
-	for _, conv := range s.inMemory.conversations {
-		if conv["id"] == id {
-			writeJSON(w, http.StatusOK, conv)
-			return
-		}
+	orgID, _, ok := tenantOr401(w, r)
+	if !ok {
+		return
 	}
-	writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "conversation not found", nil)
+	convUUID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "INVALID_CONVERSATION_ID", "invalid conversation id", nil)
+		return
+	}
+
+	// Conversa + mensagens do próprio tenant (RLS); de outro tenant ou
+	// inexistente = 404 honesto, nunca vaza conteúdo alheio.
+	var (
+		contactID, status, leadName, company, jobTitle, linkedinURL string
+		lastMsg, lastTime                                            string
+		hasReplied                                                   bool
+		found                                                        bool
+	)
+	msgs := make([]map[string]any, 0)
+
+	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
+		var cid, coid uuid.UUID
+		err := tx.QueryRow(r.Context(), `
+			SELECT conv.id, conv.contact_id, conv.status,
+			       c.full_name, COALESCE(c.company, ''), COALESCE(c.job_title, ''),
+			       COALESCE(c.linkedin_url, '')
+			FROM conversations conv
+			JOIN contacts c ON c.id = conv.contact_id AND c.organization_id = $1
+			WHERE conv.organization_id = $1 AND conv.id = $2
+		`, orgID, convUUID).Scan(&cid, &coid, &status, &leadName, &company, &jobTitle, &linkedinURL)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		contactID = coid.String()
+		found = true
+
+		mrows, err := tx.Query(r.Context(), `
+			SELECT id, direction, content, TO_CHAR(sent_at, 'HH24:MI')
+			FROM messages
+			WHERE organization_id = $1 AND conversation_id = $2
+			ORDER BY sent_at ASC
+		`, orgID, cid)
+		if err != nil {
+			return err
+		}
+		defer mrows.Close()
+		for mrows.Next() {
+			var mid uuid.UUID
+			var dir, content, sentAt string
+			if err := mrows.Scan(&mid, &dir, &content, &sentAt); err != nil {
+				continue
+			}
+			if dir == "inbound" {
+				hasReplied = true
+			}
+			if content != "" {
+				lastMsg, lastTime = content, sentAt
+			}
+			msgs = append(msgs, map[string]any{
+				"id":        mid.String(),
+				"direction": dir,
+				"content":   content,
+				"sentAt":    sentAt,
+			})
+		}
+		return mrows.Err()
+	}) {
+		return // 503 STORE_UNAVAILABLE já respondido pelo helper
+	}
+
+	if !found {
+		writeAPIError(w, http.StatusNotFound, "CONVERSATION_NOT_FOUND", "conversation not found", nil)
+		return
+	}
+	if status != "replied" && status != "archived" {
+		status = "open"
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":              convUUID.String(),
+		"contact_id":      contactID,
+		"leadName":        leadName,
+		"company":         company,
+		"jobTitle":        jobTitle,
+		"linkedinUrl":     linkedinURL,
+		"lastMessage":     lastMsg,
+		"lastMessageTime": lastTime,
+		"status":          status,
+		"hasReplied":      hasReplied,
+		"messages":        msgs,
+	})
 }

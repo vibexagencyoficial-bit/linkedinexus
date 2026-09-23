@@ -23,6 +23,7 @@ const NAV_ITEMS = [
   { label: "Inbox & Respostas", href: "/inbox", icon: Inbox },
   { label: "Templates", href: "/templates", icon: FileText },
   { label: "Atividade & Auditoria", href: "/activity", icon: Activity },
+  { label: "Extensão", href: "/extension", icon: Puzzle },
   { label: "Configurações", href: "/settings", icon: Settings },
 ];
 
@@ -91,14 +92,14 @@ export function Sidebar() {
         {!collapsed ? (
           <div className="space-y-2">
             <Link
-              href="/settings"
+              href="/extension"
               className="flex items-center justify-between p-2 rounded-md border border-zinc-800/80 bg-[#141518] hover:border-zinc-700 transition"
             >
               <div className="flex items-center gap-2">
                 <Puzzle className="w-3.5 h-3.5 text-zinc-400" />
-                <span className="text-[11px] text-zinc-300 font-medium">Extensão WXT</span>
+                <span className="text-[11px] text-zinc-300 font-medium">Extensão Chrome</span>
               </div>
-              <span className="w-2 h-2 rounded-full bg-emerald-500" title="Pronta para pareamento" />
+              <span className="w-2 h-2 rounded-full bg-emerald-500" title="Página da extensão" />
             </Link>
             <div className="flex items-center justify-between text-[10px] text-zinc-500 font-mono px-1">
               <span>POSTGRES RLS</span>
