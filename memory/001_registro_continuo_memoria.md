@@ -651,3 +651,7 @@ Atender ao "Prossiga": reconciliar o plano (.zcode/plans, que listava A1/B2/C/D/
 2. PRD curto retroativo (ou apendice neste) para 000010/000011/assist/downloads antes da proxima feature correlata.
 3. `graphify . --update` quando o binario estiver disponivel.
 4. Push para origin/main (rede GitHub nao testada nesta sessao).
+
+### Adendo [2026-09-23, pos-commit]
+- Teste de regressao `TestPendingOutreach_FilaVazia_200Honesto` (fila vazia -> 200 `has_campaign=false`, sem panico nil) executado verde junto a suite completa (31 testes backend PASS, vitest 13/13, tsc 0) e commitado em `a77ca16`.
+- Tree restante: so gerados/ignoraveis (`ext/vibexcorp-extension.zip` ja ignorado mas rastreado antes — manter; `frontend/tsconfig.tsbuildinfo` idem) + `graphify-out/` (1.8M, artefato) + `scripts/list/samples/` (fixtures do normalizador, pendente decisao de commit).
