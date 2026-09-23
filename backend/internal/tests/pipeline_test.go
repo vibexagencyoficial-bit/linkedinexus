@@ -416,3 +416,33 @@ func TestAssist_SemChave_FallbackHonesto(t *testing.T) {
 		t.Fatalf("fallback sem curva de timing: %s", rec.Body.String())
 	}
 }
+
+// Regressão do pânico 500-vazio (fila vazia): org sem campanhas e sem jobs →
+// pending-outreach responde 200 honesto com has_campaign=false, nunca deref
+// de ponteiro nil em job.queueRemaining.
+func TestPendingOutreach_FilaVazia_200Honesto(t *testing.T) {
+	c := liveClient(t)
+	srv, authSvc := liveServer(c)
+	orgID := freshTenantOrg(t, c, "pipe-empty", "Pipeline Fila Vazia")
+	token, baseReq := liveToken(t, c, authSvc, orgID)
+
+	req := httptest.NewRequest("GET", "/api/v1/messaging/pending-outreach", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req = withChiID(t, req.WithContext(baseReq.Context()), orgID.String())
+	rec := httptest.NewRecorder()
+	srv.HandleGetPendingOutreach(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("fila vazia: esperado 200, obtido %d (%s)", rec.Code, rec.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("resposta não é JSON: %v", err)
+	}
+	if out["has_campaign"] != false {
+		t.Fatalf("esperado has_campaign=false, obtido %v", out["has_campaign"])
+	}
+	if out["job"] != nil {
+		t.Fatalf("esperado job=null, obtido %v", out["job"])
+	}
+}
