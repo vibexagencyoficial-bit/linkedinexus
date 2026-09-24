@@ -20,8 +20,8 @@ vi.mock("@/lib/api", () => ({
     getExtensionStatus: mocks.getExtensionStatus,
     generatePairingCode: mocks.generatePairingCode,
   },
-  // URL estável para o teste do botão de download
-  EXTENSION_DOWNLOAD_URL: "http://localhost:8080/api/v1/downloads/extension.zip",
+  // URL estável para o teste do botão de download (zip servido pelo frontend)
+  EXTENSION_DOWNLOAD_URL: "/vibexcorp-extension.zip",
 }));
 
 import { ExtensionSection } from "@/components/settings/ExtensionSection";
@@ -44,7 +44,7 @@ describe("R4 — seção Extensão em Configurações é honesta", () => {
     expect(screen.getByText("Baixar Extensão (.zip)")).toBeTruthy();
     expect(screen.getByText("Ative o Modo do desenvolvedor")).toBeTruthy();
     const link = screen.getByText("Baixar Extensão (.zip)").closest("a");
-    expect(link?.getAttribute("href")).toContain("/downloads/extension.zip");
+    expect(link?.getAttribute("href")).toContain("vibexcorp-extension.zip");
   });
 
   it("mantém OFFLINE e mostra o erro real quando o status falha", async () => {

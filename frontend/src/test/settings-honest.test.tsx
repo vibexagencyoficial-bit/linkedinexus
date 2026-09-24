@@ -28,7 +28,7 @@ vi.mock("@/lib/api", () => ({
     saveDailyLimits: mocks.saveDailyLimits,
   },
   // A seção da extensão (agora dentro de settings) consome esta URL:
-  EXTENSION_DOWNLOAD_URL: "http://localhost:8080/api/v1/downloads/extension.zip",
+  EXTENSION_DOWNLOAD_URL: "/vibexcorp-extension.zip",
 }));
 
 import SettingsPage from "@/app/(dashboard)/settings/page";

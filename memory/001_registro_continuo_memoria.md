@@ -753,3 +753,23 @@ heartbeat 200 → ticker 4s enfileirou 3 jobs queued com render real ("Ola Ana, 
 - Login: `POST /api/v1/auth/login` (admin@vibexcorp.com/admin123 no banco local).
 - RLS na mão: `BEGIN; SELECT set_config('app.organization_id','<org-do-auth/me>',true); ...; COMMIT;` — sem isso vibex_admin vê 0 linhas (FORCE RLS).
 - Pareamento: `POST /extension/pairing-code` → `POST /extension/pair` (64 hex) → `POST /extension/heartbeat` com Bearer do device; GATE 1 do worker exige heartbeat < 2min.
+
+---
+
+## Apêndice R8 — Boot de duplo clique (iniciar.bat), extensão no frontend e migrations idempotentes (2026-09-24)
+
+### 1. Entregue
+- **`iniciar.bat` (novo, raiz do repo):** sync `ext/vibexcorp-extension.zip` → `frontend/public/`; roda `scripts/local/start.ps1`; gates de saúde (pg_isready 5433, curl `/health` 8080, curl zip + `/` na 3001, `findstr "in-memory resilient store"` no `api.log`); abre o navegador em http://localhost:3001. `VIBEX_NO_PAUSE=1` desliga o `pause` em falha (automação). `parar.bat` = wrapper do `stop.ps1`.
+- **Migrations 000002/000004/000009/000012:** `DROP POLICY IF EXISTS` antes de cada um dos 16 `CREATE POLICY` sem guarda (mesmo padrão de 000006–000011). Antes, o **segundo boot morria** na 000002 ("policy already exists") — o `start.ps1` reaplica todos os `.up.sql` com `ON_ERROR_STOP=1`.
+- **`start.ps1`:** gate `pg_isready` (até 60s) após o `Wait-Port` 5433. O Postgres binda a porta **antes** de terminar o recovery e o 1º `psql` morria com "database system is starting" sob `$ErrorActionPreference="Stop"`. `Wait-Port` só garante socket LISTEN, não prontidão de SQL.
+- **Extensão dentro do frontend:** `EXTENSION_DOWNLOAD_URL = "/vibexcorp-extension.zip"` (asset estático do Next, mesma origem, servido na 3001); zip sincronizado a cada boot pelo .bat; endpoint backend `/api/v1/downloads/extension.zip` mantido como alternativa. Mocks/assertions dos testes honestos atualizados para a nova URL.
+
+### 2. Armadilhas encontradas
+- `cmd //c bat | tail` no Git Bash **nunca termina**: o navegador aberto pelo `start ""` herda o handle do pipe e o tail nunca vê EOF. Testar .bat com redirect para arquivo (`> log 2>&1 < /dev/null`).
+- **Quirk pré-existente (benigno em re-boot):** re-aplicar 000003/000005 loga "ERRO: viola a política de segurança no nível de linha" — RLS bloqueia o INSERT do seed cuja linha já existe, e o `start.ps1` nunca checou o exit code do psql (seguia em frente). Em banco **novo**, o seed 000003 (flow_templates já sob FORCE RLS da 000002) pode falhar e precisar de superuser — verificar no primeiro boot de máquina limpa.
+
+### 3. Verificação (DoD)
+- `status.ps1` **8/8 ok**; segunda execução do boot **exit 0** com 12/12 migrations reaplicadas e API recompilada/re-subida.
+- Login real `POST /api/v1/auth/login` → 200 + JWT (owner); zip no frontend HTTP 200 com 80991 bytes = original.
+- `go vet` ok; `go test ./...` ok (internal/tests inclui cross-tenant RLS); `tsc --noEmit` ok; vitest **24/24**.
+- Jev: orchestration ×2 (roteamento; abordagem da extensão), code_review (sem escalate; change_scope ~2 = concerns separáveis), security_surface (escalate em risk_level conf 0.31 — superado por evidência medida: policies byte-idênticas + suíte RLS verde + auth intocada).
