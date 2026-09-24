@@ -41,6 +41,7 @@ $env:PATH = "$PgBin;$RedisBin;$env:PATH"
 $pgCtl = Join-Path $PgBin "pg_ctl.exe"
 $psql = Join-Path $PgBin "psql.exe"
 $initdb = Join-Path $PgBin "initdb.exe"
+$pgIsReady = Join-Path $PgBin "pg_isready.exe"
 if (-not (Test-Path $pgCtl)) { throw "pg_ctl nao encontrado em $PgBin - runtime degradado; restaure D:\vibex\tools\pgsql" }
 $redisServer = Join-Path $RedisBin "redis-server.exe"
 if (-not (Test-Path $redisServer)) { throw "redis-server nao encontrado em $RedisBin - restaure D:\vibex\tools\redis" }
@@ -72,6 +73,17 @@ if ($running -notmatch "server is running") {
   Start-Process -FilePath $pgCtl -ArgumentList "-D","$PgData","-l",$PgLog,"start" -WindowStyle Hidden -RedirectStandardOutput "$VibexRoot\logs\pg_ctl_start.log" -RedirectStandardError "$VibexRoot\logs\pg_ctl_start_err.log"
 }
 Wait-Port $PgPort "postgres"
+# Wait-Port so garante socket em LISTEN: o Postgres binda a porta antes de
+# terminar a recuperacao e responde "database system is starting" (o psql da
+# etapa seguinte morre com EAP=Stop). Gate real de prontidao = pg_isready.
+$pgReady = $false
+for ($i = 0; $i -lt 60; $i++) {
+  & $pgIsReady -h localhost -p $PgPort *> $null
+  if ($LASTEXITCODE -eq 0) { $pgReady = $true; break }
+  Start-Sleep -Seconds 1
+}
+if (-not $pgReady) { throw "postgres nao ficou pronto (pg_isready timeout 60s). Veja $PgLog." }
+Write-Host "[ok] postgres aceitando conexoes"
 
 # 2. Role + database idempotentes
 $env:PGPASSWORD = $DbPass

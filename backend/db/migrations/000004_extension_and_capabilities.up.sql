@@ -34,6 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_account_capabilities_org ON linkedin_account_capa
 -- 3. Enable RLS on both tables
 ALTER TABLE extension_devices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE extension_devices FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS extension_devices_tenant_isolation ON extension_devices;
 CREATE POLICY extension_devices_tenant_isolation ON extension_devices
     FOR ALL
     USING (organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid)
@@ -41,6 +42,7 @@ CREATE POLICY extension_devices_tenant_isolation ON extension_devices
 
 ALTER TABLE linkedin_account_capabilities ENABLE ROW LEVEL SECURITY;
 ALTER TABLE linkedin_account_capabilities FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS account_capabilities_tenant_isolation ON linkedin_account_capabilities;
 CREATE POLICY account_capabilities_tenant_isolation ON linkedin_account_capabilities
     FOR ALL
     USING (organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid)

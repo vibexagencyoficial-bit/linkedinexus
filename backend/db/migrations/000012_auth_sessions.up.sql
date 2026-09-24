@@ -29,6 +29,7 @@ ALTER TABLE extension_devices ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAM
 ALTER TABLE auth_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth_sessions FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS auth_sessions_tenant_isolation ON auth_sessions;
 CREATE POLICY auth_sessions_tenant_isolation ON auth_sessions
     FOR ALL
     USING (organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid)

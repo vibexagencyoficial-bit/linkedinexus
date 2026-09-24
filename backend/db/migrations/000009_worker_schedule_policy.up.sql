@@ -9,6 +9,7 @@
 -- que é seguro, porém paralisia silenciosa. A policy expõe SOMENTE
 -- organization_id de campanhas running (nenhum nome, contato ou mensagem).
 
+DROP POLICY IF EXISTS campaigns_worker_schedule ON campaigns;
 CREATE POLICY campaigns_worker_schedule ON campaigns
     FOR SELECT
     USING (status = 'running');
