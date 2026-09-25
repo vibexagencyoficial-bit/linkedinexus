@@ -118,6 +118,18 @@ export interface ContactInput {
   metadata?: Record<string, unknown>;
 }
 
+// Resultado de importação (CSV ou JSON): import/skipped/duplicates são
+// preenchidos pelo parser; inserted/synced mantidos por compatibilidade.
+export interface ImportContactsFileResult {
+  status?: string;
+  imported?: number;
+  skipped?: number;
+  duplicates?: number;
+  message?: string;
+  inserted?: number;
+  synced?: number;
+}
+
 export interface Campaign {
   id: string;
   name: string;
@@ -462,13 +474,17 @@ export class VibexApiClient {
     });
   }
 
-  // Upload real de arquivo (.csv multipart; .json vai como sync-linkedin).
-  async importContactsFile(file: File): Promise<{ inserted?: number; imported?: number; synced?: number; skipped?: number; status?: string }> {
+  // Upload real de arquivo (.csv multipart; .json vai bruto para o parser
+  // tolerante do backend /contacts/import-json — envelopes e aliases de
+  // chaves variam por origem da lista: perfil_linkedin_url, linkedin,
+  // linkedin_decisor, nome_decisor, empresa...).
+  async importContactsFile(file: File): Promise<ImportContactsFileResult> {
     if (file.name.toLowerCase().endsWith('.json')) {
       const text = await file.text();
-      const parsed = JSON.parse(text) as unknown;
-      const connections = Array.isArray(parsed) ? parsed : (parsed as { connections?: ContactInput[] }).connections ?? [];
-      return this.syncLinkedInContacts(connections as ContactInput[]);
+      return this.request<ImportContactsFileResult>('/contacts/import-json', {
+        method: 'POST',
+        body: text,
+      });
     }
     // multipart: sem Content-Type fixa (o browser define o boundary).
     const form = new FormData();
@@ -487,7 +503,7 @@ export class VibexApiClient {
       }
       throw new ApiError(code, msg, res.status, errBody?.error?.details);
     }
-    return res.json() as Promise<{ inserted?: number; imported?: number; skipped?: number; status?: string }>;
+    return res.json() as Promise<ImportContactsFileResult>;
   }
 
   // --- Limites globais (settings reais) ---

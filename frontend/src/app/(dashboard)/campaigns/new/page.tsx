@@ -11,6 +11,7 @@ import {
   AlertCircle,
   Upload,
   RefreshCw,
+  UserPlus,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Contact } from "@vibexcorp/api-client";
@@ -32,10 +33,22 @@ export default function NewCampaignPage() {
   const [contactsError, setContactsError] = useState<string | null>(null);
 
   // Upload CSV/JSON direto daqui: importa pela mesma API da página de
-  // contatos e recarrega a lista já marcada.
+  // contatos e recarrega a lista já marcada. Aceita vários arquivos de uma
+  // vez (a pasta de prospecção costuma ter listas sobrepostas — o backend
+  // deduplica pela URL canônica do LinkedIn).
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // Cadastro manual de contato com o link do LinkedIn na mão: cria via API
+  // e já entra na lista selecionado. Nome vazio = derivado do slug no backend.
+  const [showManual, setShowManual] = useState(false);
+  const [manualUrl, setManualUrl] = useState("");
+  const [manualName, setManualName] = useState("");
+  const [manualCompany, setManualCompany] = useState("");
+  const [manualJob, setManualJob] = useState("");
+  const [isAdding, setIsAdding] = useState(false);
+  const [manualError, setManualError] = useState<string | null>(null);
 
   const loadContacts = () => {
     api
@@ -54,31 +67,82 @@ export default function NewCampaignPage() {
     loadContacts();
   }, []);
 
-  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleImportFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
     e.target.value = ""; // permite re-selecionar o mesmo arquivo
-    if (!file) return;
-
-    const ext = file.name.toLowerCase().split(".").pop();
-    if (ext !== "csv" && ext !== "json") {
-      setImportMsg({ ok: false, text: "Formato não suportado — use .csv ou .json." });
-      return;
-    }
+    if (files.length === 0) return;
 
     setIsImporting(true);
     setImportMsg(null);
     try {
-      const res = await api.importContactsFile(file);
-      const n = res.inserted ?? res.imported ?? res.synced ?? 0;
-      setImportMsg({ ok: true, text: `${n} contatos importados de ${file.name} — confira abaixo.` });
-      loadContacts();
-    } catch (err: unknown) {
+      let total = 0;
+      const parts: string[] = [];
+      let failure: string | null = null;
+      for (const file of files) {
+        const ext = file.name.toLowerCase().split(".").pop();
+        if (ext !== "csv" && ext !== "json") {
+          parts.push(`${file.name}: formato não suportado`);
+          continue;
+        }
+        try {
+          const res = await api.importContactsFile(file);
+          const n = res.imported ?? res.inserted ?? res.synced ?? 0;
+          total += n;
+          const det = [
+            `${n} importados`,
+            res.duplicates ? `${res.duplicates} duplicados` : null,
+            res.skipped ? `${res.skipped} ignorados (sem LinkedIn)` : null,
+          ]
+            .filter(Boolean)
+            .join(", ");
+          parts.push(`${file.name}: ${det}`);
+        } catch (err: unknown) {
+          failure = `${file.name}: ${err instanceof Error ? err.message : "falha ao importar"}`;
+          break;
+        }
+      }
       setImportMsg({
-        ok: false,
-        text: err instanceof Error ? err.message : `Falha ao importar ${file.name}.`,
+        ok: failure === null,
+        text: `${total} contatos importados — ${parts.join(" · ")}` + (failure ? ` — ERRO: ${failure}` : ""),
       });
+      if (total > 0) loadContacts();
     } finally {
       setIsImporting(false);
+    }
+  };
+
+  const handleAddManual = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const url = manualUrl.trim();
+    if (!url) return;
+    if (!/linkedin\.com\/(in|pub)\//i.test(url)) {
+      setManualError("URL inválida — cole o link do perfil (linkedin.com/in/...).");
+      return;
+    }
+    setIsAdding(true);
+    setManualError(null);
+    try {
+      await api.createContact({
+        first_name: manualName.trim(),
+        full_name: manualName.trim(),
+        company: manualCompany.trim(),
+        job_title: manualJob.trim(),
+        linkedin_url: url,
+      });
+      setShowManual(false);
+      setManualUrl("");
+      setManualName("");
+      setManualCompany("");
+      setManualJob("");
+      setImportMsg({
+        ok: true,
+        text: `Contato ${manualName.trim() || url} adicionado e selecionado.`,
+      });
+      loadContacts();
+    } catch (err: unknown) {
+      setManualError(err instanceof Error ? err.message : "Falha ao adicionar contato.");
+    } finally {
+      setIsAdding(false);
     }
   };
 
@@ -299,14 +363,15 @@ export default function NewCampaignPage() {
             </div>
           </div>
 
-          {/* Upload CSV/JSON aqui dentro — importa e já entra na seleção */}
+          {/* Upload CSV/JSON (vários arquivos) + cadastro manual aqui dentro */}
           <div className="mb-2.5 flex flex-wrap items-center gap-2">
             <input
               ref={fileInputRef}
               type="file"
               accept=".csv,.json"
+              multiple
               className="hidden"
-              onChange={handleImportFile}
+              onChange={handleImportFiles}
             />
             <button
               type="button"
@@ -321,10 +386,111 @@ export default function NewCampaignPage() {
               )}
               <span>{isImporting ? "Importando..." : "Fazer upload de lista (CSV ou JSON)"}</span>
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShowManual((v) => !v);
+                setManualError(null);
+              }}
+              className={`flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-medium shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition ${
+                showManual
+                  ? "border-indigo-300 bg-indigo-50 text-indigo-700"
+                  : "border-[#e8eaf1] bg-white text-slate-700 hover:bg-slate-50"
+              }`}
+            >
+              <UserPlus className="h-4 w-4" />
+              <span>Adicionar contato manualmente</span>
+            </button>
             <span className="text-xs text-slate-400">
               lista do Google Sheets, Apollo, planilha — qualquer origem
             </span>
           </div>
+
+          {/* Formulário manual: só o link é obrigatório */}
+          {showManual && (
+            <form
+              onSubmit={handleAddManual}
+              className="mb-2.5 space-y-2.5 rounded-xl border border-[#e8eaf1] bg-[#f8f9fc] p-3.5"
+            >
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                <div className="sm:col-span-2">
+                  <label className="mb-1 block text-xs font-semibold text-slate-600">
+                    URL do LinkedIn *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={manualUrl}
+                    onChange={(e) => setManualUrl(e.target.value)}
+                    placeholder="https://www.linkedin.com/in/nome-da-pessoa"
+                    className="w-full rounded-lg border border-[#e8eaf1] bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-semibold text-slate-600">
+                    Nome completo
+                  </label>
+                  <input
+                    type="text"
+                    value={manualName}
+                    onChange={(e) => setManualName(e.target.value)}
+                    placeholder="Vazio = derivado do link"
+                    className="w-full rounded-lg border border-[#e8eaf1] bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-semibold text-slate-600">
+                    Empresa
+                  </label>
+                  <input
+                    type="text"
+                    value={manualCompany}
+                    onChange={(e) => setManualCompany(e.target.value)}
+                    placeholder="Ex: VibexCorp"
+                    className="w-full rounded-lg border border-[#e8eaf1] bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-semibold text-slate-600">
+                    Cargo
+                  </label>
+                  <input
+                    type="text"
+                    value={manualJob}
+                    onChange={(e) => setManualJob(e.target.value)}
+                    placeholder="Ex: Diretor de Tecnologia"
+                    className="w-full rounded-lg border border-[#e8eaf1] bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 transition focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                  />
+                </div>
+              </div>
+              {manualError && (
+                <p className="flex items-center gap-1.5 text-xs text-red-600">
+                  <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+                  {manualError}
+                </p>
+              )}
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowManual(false);
+                    setManualError(null);
+                  }}
+                  className="rounded-lg px-3 py-1.5 text-sm font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isAdding}
+                  className="flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-1.5 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  {isAdding ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  <span>{isAdding ? "Adicionando..." : "Adicionar contato"}</span>
+                </button>
+              </div>
+            </form>
+          )}
 
           {/* Resultado honesto do upload */}
           {importMsg && (
@@ -354,7 +520,7 @@ export default function NewCampaignPage() {
             </div>
           ) : contacts.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#d5d9e4] bg-[#f8f9fc] p-4 text-sm text-slate-500">
-              Nenhum contato cadastrado ainda. Use o botão acima para importar sua lista (CSV ou JSON) — depois de importar, os contatos aparecem aqui já selecionados.
+              Nenhum contato cadastrado ainda. Use os botões acima para importar sua lista (CSV ou JSON, vários arquivos de uma vez) ou cadastrar um contato manualmente com o link do LinkedIn — depois, os contatos aparecem aqui já selecionados.
             </div>
           ) : (
             <div className="max-h-56 divide-y divide-[#eef0f6] overflow-y-auto rounded-xl border border-[#e8eaf1] bg-white">

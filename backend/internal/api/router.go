@@ -116,6 +116,7 @@ func (s *Server) SetupRouter() *chi.Mux {
 			r.Get("/contacts/{id}", s.HandleGetContact)
 			r.Delete("/contacts/{id}", s.HandleDeleteContact)
 			r.Post("/contacts/import", s.HandleImportContactsCSV)
+			r.Post("/contacts/import-json", s.HandleImportContactsJSON)
 			r.Post("/contacts/sync-linkedin", s.HandleSyncLinkedInContacts)
 
 			// Messaging & Outreach Dispatch (Apollo.io Model)

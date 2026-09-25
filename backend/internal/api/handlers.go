@@ -872,9 +872,22 @@ func (s *Server) HandleCreateContact(w http.ResponseWriter, r *http.Request) {
 	if in.FirstName == "" && in.FullName != "" {
 		in.FirstName, in.LastName = splitFullName(in.FullName)
 	}
+	// Mesma canonicalização do import JSON: contato manual e importado
+	// deduplicam pela URL canônica (br.→www., %C3%A9→é, barra final fora).
+	if cu := canonicalLinkedInURL(in.LinkedInURL); cu != "" {
+		in.LinkedInURL = cu
+	}
 	if in.LinkedInURL == "" {
 		writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "linkedin_url is required", nil)
 		return
+	}
+	// Contato cadastrado só com o link: deriva nome legível do slug, senão
+	// {{first_name}} trava a cadência com missing_variables.
+	if in.FirstName == "" && in.FullName == "" {
+		if derived := nameFromLinkedInSlug(in.LinkedInURL); derived != "" {
+			in.FullName = derived
+			in.FirstName, in.LastName = splitFullName(derived)
+		}
 	}
 
 	contactID := uuid.New()
@@ -1211,10 +1224,17 @@ func (s *Server) HandleSyncLinkedInContacts(w http.ResponseWriter, r *http.Reque
 	seen := make(map[string]bool)
 	rows := make([]syncRow, 0, len(req.Connections))
 	for _, c := range req.Connections {
-		if c.LinkedInURL == "" || seen[c.LinkedInURL] {
+		// Mesma canonicalização do import JSON: conexões capturadas pela
+		// extensão deduplicam com contatos importados/manual pela URL
+		// canônica (br.→www., %C3%A9→é, barra final fora).
+		url := c.LinkedInURL
+		if cu := canonicalLinkedInURL(url); cu != "" {
+			url = cu
+		}
+		if url == "" || seen[url] {
 			continue
 		}
-		seen[c.LinkedInURL] = true
+		seen[url] = true
 		full := c.FullName
 		if full == "" && c.FirstName != "" {
 			full = strings.TrimSpace(c.FirstName + " " + c.LastName)
@@ -1224,42 +1244,22 @@ func (s *Server) HandleSyncLinkedInContacts(w http.ResponseWriter, r *http.Reque
 			fn, ln = splitFullName(full)
 		}
 		metaJSON, _ := json.Marshal(c.Metadata)
-		rows = append(rows, syncRow{fn, ln, full, c.Company, c.JobTitle, c.LinkedInURL, metaJSON})
+		rows = append(rows, syncRow{fn, ln, full, c.Company, c.JobTitle, url, metaJSON})
 	}
 
-	batch := make([][]any, 0, len(rows))
+	// Sync inteiro numa única transação com tenant. Upsert em lote via
+	// insertContactsUpsert (pg.Batch pipelined): COPY FROM não é suportado
+	// com RLS ativa (SQLSTATE 0A000) — mesmo motivo do import CSV/JSON.
+	upserts := make([]contactUpsertRow, 0, len(rows))
 	for _, row := range rows {
-		batch = append(batch, []any{orgID, row.fn, row.ln, row.full, row.comp, row.job, row.url, row.meta})
+		upserts = append(upserts, contactUpsertRow{
+			fn: row.fn, ln: row.ln, full: row.full,
+			comp: row.comp, job: row.job, url: row.url, meta: row.meta,
+		})
 	}
-
-	// Sync inteiro numa única transação com tenant. INSERT em lote
-	// (pgx.Batch pipelined): COPY FROM não é suportado com RLS ativa
-	// (SQLSTATE 0A000) — mesmo motivo do import CSV.
 	if !s.withTenantDB(w, r, orgID, func(tx pgx.Tx) error {
-		const chunk = 500
-		for start := 0; start < len(batch); start += chunk {
-			end := start + chunk
-			if end > len(batch) {
-				end = len(batch)
-			}
-			b := &pgx.Batch{}
-			for _, row := range batch[start:end] {
-				b.Queue(`
-					INSERT INTO contacts (organization_id, first_name, last_name, full_name, company, job_title, linkedin_url, metadata)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-					ON CONFLICT (organization_id, linkedin_url) DO UPDATE SET
-						first_name = EXCLUDED.first_name,
-						last_name = EXCLUDED.last_name,
-						full_name = EXCLUDED.full_name,
-						company = EXCLUDED.company,
-						job_title = EXCLUDED.job_title,
-						metadata = EXCLUDED.metadata,
-						updated_at = NOW()
-				`, row...)
-			}
-			if err := tx.SendBatch(r.Context(), b).Close(); err != nil {
-				return err
-			}
+		if err := insertContactsUpsert(r.Context(), tx, orgID, upserts); err != nil {
+			return err
 		}
 		_, err := tx.Exec(r.Context(), `
 			DELETE FROM contacts a USING contacts b

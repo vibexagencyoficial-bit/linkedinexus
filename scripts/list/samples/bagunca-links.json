@@ -1,0 +1,28 @@
+{
+  "connections": [
+    {
+      "name": "Rafael Duarte",
+      "empresa": "Stone",
+      "cargo": "Engineering Manager",
+      "linkedin": "https://www.linkedin.com/in/rafael-duarte-em/?originalSubdomain=br"
+    },
+    {
+      "First Name": "Juliana",
+      "Last Name": "Almeida",
+      "Company": "iFood",
+      "Job Title": "Diretora de Produto",
+      "LinkedIn URL": "https://www.linkedin.com/in/juliana-almeida-product"
+    },
+    {
+      "nome": "Sem URL Alguém",
+      "empresa": "Nada",
+      "cargo": "Estagiário"
+    },
+    {
+      "nome": "Rafael Duarte",
+      "empresa": "Stone",
+      "cargo": "Engineering Manager",
+      "linkedin": "https://www.linkedin.com/in/rafael-duarte-em"
+    }
+  ]
+}
