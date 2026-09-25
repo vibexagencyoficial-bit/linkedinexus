@@ -49,3 +49,6 @@ pnpm-debug.log*
 *.tsbuildinfo
 tsconfig.tsbuildinfo
 ext/vibexcorp-extension.zip
+
+# Graphify (cache AST e grafo gerados)
+graphify-out/
